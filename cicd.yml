@@ -133,6 +133,8 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
+          timeout: 120s
+          command_timeout: 15m
           script: |
             set -e
 
@@ -196,6 +198,7 @@ jobs:
 
       - name: Notify success via email
         if: success() && env.MAIL_NOTIFY_READY == 'true'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
@@ -231,6 +234,7 @@ jobs:
 
       - name: Notify failure via email
         if: failure() && env.MAIL_NOTIFY_READY == 'true'
+        continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
