@@ -99,7 +99,7 @@ jobs:
     needs: [test, build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
-    # Nama environment harus sama dengan Settings → Environments. Optional: variable DEPLOY_ENV jika nama bukan "production".
+    # DEPLOY_ENV di Repository/Org variables = nama persis environment (contoh: Starlink CRM / production), bukan hanya variable di dalam environment.
     environment:
       name: ${{ vars.DEPLOY_ENV != '' && vars.DEPLOY_ENV || 'production' }}
       url: ${{ vars.APP_URL }}
@@ -121,9 +121,9 @@ jobs:
           DEPLOY_ENV_NAME: ${{ vars.DEPLOY_ENV != '' && vars.DEPLOY_ENV || 'production' }}
         run: |
           missing=0
-          if [ -z "$VPS_HOST" ]; then echo "::error::VPS_HOST kosong. Tambahkan di Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets; atau set DEPLOY_ENV ke nama environment yang berisi secret."; missing=1; fi
-          if [ -z "$VPS_USER" ]; then echo "::error::VPS_USER kosong — Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets."; missing=1; fi
-          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::VPS_SSH_KEY kosong — Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets."; missing=1; fi
+          if [ -z "$VPS_HOST" ]; then echo "::error::VPS_HOST kosong. Job pakai environment \"$DEPLOY_ENV_NAME\". Set Repository variable DEPLOY_ENV ke nama persis environment GitHub yang berisi secret, atau Repository secrets."; missing=1; fi
+          if [ -z "$VPS_USER" ]; then echo "::error::VPS_USER kosong — DEPLOY_ENV (Repository) atau Repository secrets."; missing=1; fi
+          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::VPS_SSH_KEY kosong — DEPLOY_ENV (Repository) atau Repository secrets."; missing=1; fi
           exit $missing
 
       - name: Deploy via SSH
