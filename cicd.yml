@@ -107,13 +107,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Host boleh di Environment variables (vars.VPS_HOST) atau secrets; kunci SSH harus secret.
+      - name: Pastikan konfigurasi VPS terisi
+        env:
+          VPS_HOST: ${{ vars.VPS_HOST != '' && vars.VPS_HOST || secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          missing=0
+          if [ -z "$VPS_HOST" ]; then echo "::error::VPS_HOST kosong. Isi sebagai Environment variable atau secret \"VPS_HOST\" di environment production (bukan hanya nama mirip). Workflow membaca vars.VPS_HOST lalu secrets.VPS_HOST."; missing=1; fi
+          if [ -z "$VPS_USER" ]; then echo "::error::VPS_USER kosong — tambahkan di Environment secrets untuk production."; missing=1; fi
+          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::VPS_SSH_KEY kosong — private key penuh (termasuk -----BEGIN ... KEY-----)."; missing=1; fi
+          exit $missing
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
+          host: ${{ vars.VPS_HOST != '' && vars.VPS_HOST || secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          port: ${{ secrets.VPS_PORT || 22 }}
+          port: ${{ secrets.VPS_PORT != '' && secrets.VPS_PORT || '22' }}
           script: |
             set -e
 
@@ -176,16 +189,16 @@ jobs:
             echo "[$TIMESTAMP] Deploy SUCCESS - status: $STATUS" >> $DEPLOY_LOG
 
       - name: Notify success via email
-        if: success()
+        if: success() && secrets.SMTP_PASS != '' && (vars.SMTP_HOST != '' || secrets.SMTP_HOST != '') && (vars.NOTIFY_EMAIL != '' || secrets.NOTIFY_EMAIL != '')
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USER }}
+          server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
+          server_port: ${{ vars.SMTP_PORT != '' && vars.SMTP_PORT || secrets.SMTP_PORT }}
+          username: ${{ vars.SMTP_USER != '' && vars.SMTP_USER || secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
           subject: "✅ Deploy Berhasil — ${{ env.APP_NAME }}"
-          to: ${{ secrets.NOTIFY_EMAIL }}
-          from: "VPS CI/CD <${{ secrets.SMTP_USER }}>"
+          to: ${{ vars.NOTIFY_EMAIL != '' && vars.NOTIFY_EMAIL || secrets.NOTIFY_EMAIL }}
+          from: "VPS CI/CD <${{ vars.SMTP_USER != '' && vars.SMTP_USER || secrets.SMTP_USER }}>"
           html_body: |
             <div style="font-family:sans-serif;max-width:600px;">
               <div style="background:#22c55e;color:white;padding:16px 20px;border-radius:8px 8px 0 0;">
@@ -211,16 +224,16 @@ jobs:
             </div>
 
       - name: Notify failure via email
-        if: failure()
+        if: failure() && secrets.SMTP_PASS != '' && (vars.SMTP_HOST != '' || secrets.SMTP_HOST != '') && (vars.NOTIFY_EMAIL != '' || secrets.NOTIFY_EMAIL != '')
         uses: dawidd6/action-send-mail@v3
         with:
-          server_address: ${{ secrets.SMTP_HOST }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USER }}
+          server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
+          server_port: ${{ vars.SMTP_PORT != '' && vars.SMTP_PORT || secrets.SMTP_PORT }}
+          username: ${{ vars.SMTP_USER != '' && vars.SMTP_USER || secrets.SMTP_USER }}
           password: ${{ secrets.SMTP_PASS }}
           subject: "🚨 Deploy GAGAL — ${{ env.APP_NAME }}"
-          to: ${{ secrets.NOTIFY_EMAIL }}
-          from: "VPS CI/CD <${{ secrets.SMTP_USER }}>"
+          to: ${{ vars.NOTIFY_EMAIL != '' && vars.NOTIFY_EMAIL || secrets.NOTIFY_EMAIL }}
+          from: "VPS CI/CD <${{ vars.SMTP_USER != '' && vars.SMTP_USER || secrets.SMTP_USER }}>"
           html_body: |
             <div style="font-family:sans-serif;max-width:600px;">
               <div style="background:#ef4444;color:white;padding:16px 20px;border-radius:8px 8px 0 0;">
