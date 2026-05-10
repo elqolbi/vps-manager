@@ -103,6 +103,10 @@ jobs:
       name: production
       url: ${{ vars.APP_URL }}
 
+    # secrets tidak boleh dipakai di step if(); hitung flag di job env (mengizinkan secrets).
+    env:
+      MAIL_NOTIFY_READY: ${{ secrets.SMTP_PASS != '' && (vars.SMTP_HOST != '' || secrets.SMTP_HOST != '') && (vars.NOTIFY_EMAIL != '' || secrets.NOTIFY_EMAIL != '') }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -189,7 +193,7 @@ jobs:
             echo "[$TIMESTAMP] Deploy SUCCESS - status: $STATUS" >> $DEPLOY_LOG
 
       - name: Notify success via email
-        if: success() && secrets.SMTP_PASS != '' && (vars.SMTP_HOST != '' || secrets.SMTP_HOST != '') && (vars.NOTIFY_EMAIL != '' || secrets.NOTIFY_EMAIL != '')
+        if: success() && env.MAIL_NOTIFY_READY == 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
@@ -224,7 +228,7 @@ jobs:
             </div>
 
       - name: Notify failure via email
-        if: failure() && secrets.SMTP_PASS != '' && (vars.SMTP_HOST != '' || secrets.SMTP_HOST != '') && (vars.NOTIFY_EMAIL != '' || secrets.NOTIFY_EMAIL != '')
+        if: failure() && env.MAIL_NOTIFY_READY == 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: ${{ vars.SMTP_HOST != '' && vars.SMTP_HOST || secrets.SMTP_HOST }}
