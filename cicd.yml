@@ -99,8 +99,9 @@ jobs:
     needs: [test, build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
+    # Nama environment harus sama dengan Settings → Environments. Optional: variable DEPLOY_ENV jika nama bukan "production".
     environment:
-      name: production
+      name: ${{ vars.DEPLOY_ENV != '' && vars.DEPLOY_ENV || 'production' }}
       url: ${{ vars.APP_URL }}
 
     # secrets tidak boleh dipakai di step if(); hitung flag di job env (mengizinkan secrets).
@@ -117,11 +118,12 @@ jobs:
           VPS_HOST: ${{ vars.VPS_HOST != '' && vars.VPS_HOST || secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          DEPLOY_ENV_NAME: ${{ vars.DEPLOY_ENV != '' && vars.DEPLOY_ENV || 'production' }}
         run: |
           missing=0
-          if [ -z "$VPS_HOST" ]; then echo "::error::VPS_HOST kosong. Isi sebagai Environment variable atau secret \"VPS_HOST\" di environment production (bukan hanya nama mirip). Workflow membaca vars.VPS_HOST lalu secrets.VPS_HOST."; missing=1; fi
-          if [ -z "$VPS_USER" ]; then echo "::error::VPS_USER kosong — tambahkan di Environment secrets untuk production."; missing=1; fi
-          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::VPS_SSH_KEY kosong — private key penuh (termasuk -----BEGIN ... KEY-----)."; missing=1; fi
+          if [ -z "$VPS_HOST" ]; then echo "::error::VPS_HOST kosong. Tambahkan di Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets; atau set DEPLOY_ENV ke nama environment yang berisi secret."; missing=1; fi
+          if [ -z "$VPS_USER" ]; then echo "::error::VPS_USER kosong — Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets."; missing=1; fi
+          if [ -z "$VPS_SSH_KEY" ]; then echo "::error::VPS_SSH_KEY kosong — Environment \"$DEPLOY_ENV_NAME\" atau Repository secrets."; missing=1; fi
           exit $missing
 
       - name: Deploy via SSH
