@@ -1,0 +1,247 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Batalkan run lama jika ada push baru
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  APP_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: TEST & LINT
+  # ──────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: npm test --if-present
+        env:
+          NODE_ENV: test
+          CI: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            coverage/
+            test-results/
+          retention-days: 7
+
+  # ──────────────────────────────────────────
+  # JOB 2: BUILD CHECK
+  # ──────────────────────────────────────────
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build --if-present
+        env:
+          NODE_ENV: production
+
+      - name: Check bundle size
+        run: |
+          if [ -d "dist" ]; then
+            echo "Build output size:"
+            du -sh dist/
+          fi
+
+  # ──────────────────────────────────────────
+  # JOB 3: DEPLOY KE VPS
+  # ──────────────────────────────────────────
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            set -e
+
+            APP_NAME="${{ env.APP_NAME }}"
+            APP_DIR="/home/${{ secrets.VPS_USER }}/apps/$APP_NAME"
+            DEPLOY_LOG="/home/${{ secrets.VPS_USER }}/apps/$APP_NAME/.deploy.log"
+            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+            echo "[$TIMESTAMP] Starting deploy: ${{ github.sha }}" >> $DEPLOY_LOG
+
+            # Load NVM
+            export NVM_DIR="$HOME/.nvm"
+            [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+            # Masuk ke direktori app
+            cd $APP_DIR
+
+            # Simpan hash commit sebelum deploy (untuk rollback)
+            PREV_COMMIT=$(git rev-parse HEAD)
+            echo "[$TIMESTAMP] Previous commit: $PREV_COMMIT" >> $DEPLOY_LOG
+
+            # Pull kode terbaru
+            git fetch --all
+            git reset --hard origin/${{ github.ref_name }}
+
+            echo "[$TIMESTAMP] Pulled commit: $(git rev-parse HEAD)" >> $DEPLOY_LOG
+
+            # Install dependencies (hanya yang berubah)
+            npm ci --production
+
+            # Build jika ada script build
+            if grep -q '"build"' package.json 2>/dev/null; then
+              echo "[$TIMESTAMP] Running build..." >> $DEPLOY_LOG
+              npm run build
+            fi
+
+            # Zero-downtime restart dengan PM2
+            pm2 reload $APP_NAME --update-env || pm2 start ecosystem.config.js --only $APP_NAME
+
+            # Tunggu app healthy (max 30 detik)
+            echo "[$TIMESTAMP] Waiting for app to be healthy..." >> $DEPLOY_LOG
+            sleep 3
+            STATUS=$(pm2 jlist | python3 -c "
+            import sys,json
+            procs=json.load(sys.stdin)
+            p=next((x for x in procs if x['name']=='$APP_NAME'),None)
+            print(p['pm2_env']['status'] if p else 'not_found')
+            ")
+
+            if [ "$STATUS" != "online" ]; then
+              echo "[$TIMESTAMP] ERROR: App status is $STATUS, rolling back..." >> $DEPLOY_LOG
+              git reset --hard $PREV_COMMIT
+              npm ci --production
+              pm2 reload $APP_NAME --update-env
+              echo "[$TIMESTAMP] Rollback complete" >> $DEPLOY_LOG
+              exit 1
+            fi
+
+            pm2 save
+            echo "[$TIMESTAMP] Deploy SUCCESS - status: $STATUS" >> $DEPLOY_LOG
+
+      - name: Notify success via email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "✅ Deploy Berhasil — ${{ env.APP_NAME }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: "VPS CI/CD <${{ secrets.SMTP_USER }}>"
+          html_body: |
+            <div style="font-family:sans-serif;max-width:600px;">
+              <div style="background:#22c55e;color:white;padding:16px 20px;border-radius:8px 8px 0 0;">
+                <h2 style="margin:0;">✅ Deploy Berhasil</h2>
+              </div>
+              <div style="border:1px solid #e5e7eb;border-top:none;padding:20px;border-radius:0 0 8px 8px;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr><td style="color:#6b7280;padding:6px 0;width:120px;">App</td><td style="font-weight:600;">${{ env.APP_NAME }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Branch</td><td>${{ github.ref_name }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Commit</td><td style="font-family:monospace;">${{ github.sha }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Pesan</td><td>${{ github.event.head_commit.message }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Author</td><td>${{ github.actor }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Waktu</td><td>${{ github.event.head_commit.timestamp }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">URL</td><td><a href="${{ vars.APP_URL }}">${{ vars.APP_URL }}</a></td></tr>
+                </table>
+                <div style="margin-top:16px;">
+                  <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                     style="background:#0ea5e9;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;">
+                    Lihat Detail Run →
+                  </a>
+                </div>
+              </div>
+            </div>
+
+      - name: Notify failure via email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_HOST }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          subject: "🚨 Deploy GAGAL — ${{ env.APP_NAME }}"
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: "VPS CI/CD <${{ secrets.SMTP_USER }}>"
+          html_body: |
+            <div style="font-family:sans-serif;max-width:600px;">
+              <div style="background:#ef4444;color:white;padding:16px 20px;border-radius:8px 8px 0 0;">
+                <h2 style="margin:0;">🚨 Deploy Gagal</h2>
+              </div>
+              <div style="border:1px solid #e5e7eb;border-top:none;padding:20px;border-radius:0 0 8px 8px;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tr><td style="color:#6b7280;padding:6px 0;width:120px;">App</td><td style="font-weight:600;">${{ env.APP_NAME }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Branch</td><td>${{ github.ref_name }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Commit</td><td style="font-family:monospace;">${{ github.sha }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Pesan</td><td>${{ github.event.head_commit.message }}</td></tr>
+                  <tr><td style="color:#6b7280;padding:6px 0;">Author</td><td>${{ github.actor }}</td></tr>
+                </table>
+                <div style="margin-top:12px;padding:12px;background:#fef2f2;border-radius:6px;font-size:13px;color:#dc2626;">
+                  ⚠ Rollback otomatis telah dijalankan ke commit sebelumnya.
+                </div>
+                <div style="margin-top:16px;">
+                  <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                     style="background:#ef4444;color:white;padding:8px 16px;border-radius:6px;text-decoration:none;font-size:13px;">
+                    Lihat Error Log →
+                  </a>
+                </div>
+              </div>
+            </div>
