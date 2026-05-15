@@ -194,6 +194,21 @@ jobs:
             fi
 
             pm2 save
+            UPDATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            UPDATED_COMMIT=$(git rev-parse HEAD)
+            touch .vps-meta
+            set_meta() {
+              key="$1"
+              value="$2"
+              if grep -q "^${key}=" .vps-meta; then
+                sed -i "s|^${key}=.*|${key}=${value}|" .vps-meta
+              else
+                printf '%s=%s\n' "$key" "$value" >> .vps-meta
+              fi
+            }
+            set_meta UPDATED_AT "$UPDATED_AT"
+            set_meta UPDATED_BY "ci/cd"
+            set_meta UPDATED_COMMIT "$UPDATED_COMMIT"
             echo "[$TIMESTAMP] Deploy SUCCESS - status: $STATUS" >> $DEPLOY_LOG
 
       - name: Notify success via email

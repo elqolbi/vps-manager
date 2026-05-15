@@ -322,6 +322,59 @@ const readMeta = (app) => {
   );
 };
 
+const normalizeDeployLogTimestamp = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const isoLike = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(isoLike) ? isoLike : `${isoLike}Z`;
+  const date = new Date(withZone);
+  return Number.isNaN(date.getTime()) ? raw : date.toISOString();
+};
+
+const readLastDeployLogUpdate = (projectDir) => {
+  const deployLog = path.join(projectDir, '.deploy.log');
+  if (!fs.existsSync(deployLog)) return null;
+  try {
+    const lines = fs.readFileSync(deployLog, 'utf8').trim().split('\n').reverse();
+    for (const line of lines) {
+      const m = line.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+Deploy SUCCESS\b/);
+      if (m) return { at: normalizeDeployLogTimestamp(m[1]), by: 'ci/cd', commit: '' };
+    }
+  } catch (_) {}
+  return null;
+};
+
+const getProjectUpdatedInfo = (projectDir, meta) => {
+  const at = meta.UPDATED_AT || meta.LAST_UPDATED_AT || meta.DEPLOYED_AT || '';
+  if (at) {
+    return {
+      at: normalizeDeployLogTimestamp(at),
+      by: meta.UPDATED_BY || meta.LAST_UPDATED_BY || '',
+      commit: meta.UPDATED_COMMIT || meta.LAST_UPDATED_COMMIT || '',
+    };
+  }
+  return readLastDeployLogUpdate(projectDir) || { at: '', by: '', commit: '' };
+};
+
+const getProjectGitCommit = (projectDir) => {
+  try {
+    return execSync(`git -C ${shSingleQuote(projectDir)} rev-parse HEAD`, { encoding: 'utf8' }).trim();
+  } catch (_) {
+    return '';
+  }
+};
+
+const recordProjectUpdated = (projectDir, source) => {
+  const updatedAt = new Date().toISOString();
+  const commit = getProjectGitCommit(projectDir);
+  updateVpsMetaInDir(projectDir, {
+    UPDATED_AT: updatedAt,
+    UPDATED_BY: source,
+    UPDATED_COMMIT: commit,
+  });
+  return { updatedAt, commit };
+};
+
 /** Template GitHub Actions (disalin ke project sebagai .github/workflows/deploy.yml). */
 const CICD_TEMPLATE_PATH = path.join(__dirname, 'cicd.yml');
 
@@ -729,6 +782,7 @@ app.get('/api/projects', auth, (req, res) => {
     const proc = pm2.find(p => p.name === app);
     const env = readEnv(app);
     const pdir = resolveProjectDir(app);
+    const updated = getProjectUpdatedInfo(pdir, meta);
     return {
       name: app,
       status: proc?.pm2_env?.status || 'stopped',
@@ -737,6 +791,9 @@ app.get('/api/projects', auth, (req, res) => {
       repo: meta.REPO_URL || '',
       branch: meta.BRANCH || 'main',
       installedAt: meta.INSTALLED_AT || '',
+      updatedAt: updated.at,
+      updatedBy: updated.by,
+      updatedCommit: updated.commit,
       uptime: proc?.pm2_env?.pm_uptime || null,
       restarts: proc?.pm2_env?.restart_time || 0,
       memory: proc?.monit?.memory || 0,
@@ -829,7 +886,8 @@ app.post('/api/projects/:name/deploy', auth, (req, res) => {
       runProjectBuildIfAny(dir);
       refreshPm2StarterScript(name, dir);
       pm2RestartWithEnvFromProject(name);
-      res.json({ success: true });
+      const updated = recordProjectUpdated(dir, 'dashboard');
+      res.json({ success: true, updatedAt: updated.updatedAt, updatedCommit: updated.commit });
     } catch (e) {
       res.status(500).json({ error: 'Deploy failed: ' + e.message });
     }
@@ -2384,6 +2442,19 @@ function fmtBytes(b) {
   return (b/1024/1024).toFixed(1)+' MB';
 }
 
+function fmtDate(v) {
+  if (!v) return '';
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? String(v).slice(0, 10) : d.toLocaleDateString();
+}
+
+function projectDateLine(p) {
+  const parts = [];
+  if (p.installedAt) parts.push('installed ' + fmtDate(p.installedAt));
+  if (p.updatedAt) parts.push('updated ' + fmtDate(p.updatedAt));
+  return parts.length ? ' &nbsp;·&nbsp; ' + parts.join(' &nbsp;·&nbsp; ') : '';
+}
+
 async function loadOverview() {
   const [sys, projs] = await Promise.all([api('GET','/system'), api('GET','/projects')]);
   projects = projs;
@@ -2431,7 +2502,7 @@ async function loadProjects() {
             <div style="font-size:12px;color:var(--muted);">
               \${p.repo ? '<a href="'+p.repo+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.repo.replace('https://github.com/','')+'</a>' : '-'}
               \${p.domain ? ' &nbsp;·&nbsp; <a href="http://'+p.domain+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.domain+'</a>' : ''}
-              \${p.installedAt ? ' &nbsp;·&nbsp; installed '+new Date(p.installedAt).toLocaleDateString() : ''}
+              \${projectDateLine(p)}
             </div>
           </div>
           <div class="btn-group">
