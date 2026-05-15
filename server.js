@@ -10,7 +10,9 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const dns = require('dns').promises;
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 
 const app = express();
@@ -23,6 +25,25 @@ const PG_PASS = process.env.PG_PASS || '';
 const PG_DB = process.env.PG_DB || 'appdb';
 const REDIS_PASS = process.env.REDIS_PASS || '';
 const DASHBOARD_PASS = process.env.DASHBOARD_PASS || 'admin123';
+const AUTH_FILE = path.join(__dirname, '.dashboard-auth.json');
+
+const readPasswordHash = () => {
+  try {
+    const data = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+    return data.passwordHash || null;
+  } catch { return null; }
+};
+
+const verifyDashboardPassword = (password) => {
+  const hash = readPasswordHash();
+  if (hash) return bcrypt.compareSync(String(password), hash);
+  return String(password) === DASHBOARD_PASS;
+};
+
+const saveDashboardPassword = (password) => {
+  const passwordHash = bcrypt.hashSync(String(password), 10);
+  fs.writeFileSync(AUTH_FILE, JSON.stringify({ passwordHash }), { mode: 0o600 });
+};
 /** Identitas commit untuk perintah git dari manager (user deploy sering belum punya user.name / user.email global). */
 const MANAGER_GIT_AUTHOR_NAME = process.env.MANAGER_GIT_AUTHOR_NAME || 'VPS Manager';
 const MANAGER_GIT_AUTHOR_EMAIL = process.env.MANAGER_GIT_AUTHOR_EMAIL || 'vps-manager@localhost';
@@ -36,7 +57,7 @@ try {
 app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -45,7 +66,7 @@ app.use((req, res, next) => {
 // ── AUTH ─────────────────────────────────────────────────────
 app.post('/api/login', (req, res) => {
   const { password } = req.body;
-  if (password !== DASHBOARD_PASS) return res.status(401).json({ error: 'Wrong password' });
+  if (!verifyDashboardPassword(password)) return res.status(401).json({ error: 'Wrong password' });
   const token = jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '24h' });
   res.json({ token });
 });
@@ -58,6 +79,22 @@ const auth = (req, res, next) => {
     next();
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
+
+app.put('/api/account/password', auth, (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length < 6) {
+    return res.status(400).json({ error: 'Sandi baru minimal 6 karakter' });
+  }
+  if (!verifyDashboardPassword(currentPassword)) {
+    return res.status(401).json({ error: 'Sandi saat ini salah' });
+  }
+  try {
+    saveDashboardPassword(newPassword);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Gagal menyimpan sandi' });
+  }
+});
 
 // ── HELPERS ──────────────────────────────────────────────────
 const runAs = (cmd) => {
@@ -143,17 +180,40 @@ const readPackageJson = (projectDir) => {
   }
 };
 
+const PNPM_COREPACK_VERSION = '9.15.9';
+
+const projectUsesPnpm = (projectDir) => {
+  if (fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml'))) return true;
+  if (fs.existsSync(path.join(projectDir, 'pnpm-workspace.yaml'))) return true;
+  const pkg = readPackageJson(projectDir);
+  return !!(pkg && typeof pkg.packageManager === 'string' && pkg.packageManager.startsWith('pnpm@'));
+};
+
+const projectRunPrefix = (projectDir) => (projectUsesPnpm(projectDir) ? 'pnpm' : 'npm');
+
+const preparePnpmShell = `corepack enable >/dev/null 2>&1; corepack prepare pnpm@${PNPM_COREPACK_VERSION} --activate >/dev/null 2>&1`;
+
+const runProjectDepsInstall = (projectDir) => {
+  const dirQ = shSingleQuote(projectDir);
+  if (projectUsesPnpm(projectDir)) {
+    runAsThrow(`cd ${dirQ} && ${preparePnpmShell} && pnpm install`);
+    return;
+  }
+  runAsThrow(`cd ${dirQ} && npm install`);
+};
+
 /** Urutan: build → web+server → salah satu (monorepo / fullstack Node umum). */
 const resolveNpmBuildCommand = (projectDir) => {
   const pkg = readPackageJson(projectDir);
   if (!pkg || !pkg.scripts) return null;
   const s = pkg.scripts;
-  if (typeof s.build === 'string' && s.build.trim()) return 'npm run build';
+  const pm = projectRunPrefix(projectDir);
+  if (typeof s.build === 'string' && s.build.trim()) return `${pm} run build`;
   const hasWeb = typeof s['web:build'] === 'string' && s['web:build'].trim();
   const hasServer = typeof s['server:build'] === 'string' && s['server:build'].trim();
-  if (hasWeb && hasServer) return 'npm run web:build && npm run server:build';
-  if (hasWeb) return 'npm run web:build';
-  if (hasServer) return 'npm run server:build';
+  if (hasWeb && hasServer) return `${pm} run web:build && ${pm} run server:build`;
+  if (hasWeb) return `${pm} run web:build`;
+  if (hasServer) return `${pm} run server:build`;
   return null;
 };
 
@@ -178,14 +238,17 @@ const resolvePm2StartInnerCommand = (projectDir) => {
   const pkg = readPackageJson(projectDir);
   if (!pkg) return null;
   const s = pkg.scripts || {};
-  if (typeof s.start === 'string' && s.start.trim()) return 'npm start';
-  if (typeof s['server:prod'] === 'string' && s['server:prod'].trim()) return 'npm run server:prod';
-  if (typeof s.prod === 'string' && s.prod.trim()) return 'npm run prod';
+  const pm = projectRunPrefix(projectDir);
+  if (typeof s.start === 'string' && s.start.trim()) return `${pm} start`;
+  if (typeof s['server:prod'] === 'string' && s['server:prod'].trim()) return `${pm} run server:prod`;
+  if (typeof s.prod === 'string' && s.prod.trim()) return `${pm} run prod`;
   const main = typeof pkg.main === 'string' ? pkg.main.trim() : '';
   if (main && fs.existsSync(path.join(projectDir, main))) return `node ${main}`;
-  if (fs.existsSync(path.join(projectDir, 'dist', 'index.cjs'))) return 'NODE_ENV=production node dist/index.cjs';
-  if (fs.existsSync(path.join(projectDir, 'dist', 'index.js'))) return 'NODE_ENV=production node dist/index.js';
-  if (fs.existsSync(path.join(projectDir, 'server_dist', 'index.js'))) return 'NODE_ENV=production node server_dist/index.js';
+  const apiServerCjs = path.join(projectDir, 'artifacts', 'api-server', 'dist', 'index.cjs');
+  if (fs.existsSync(apiServerCjs)) return 'node artifacts/api-server/dist/index.cjs';
+  if (fs.existsSync(path.join(projectDir, 'dist', 'index.cjs'))) return 'node dist/index.cjs';
+  if (fs.existsSync(path.join(projectDir, 'dist', 'index.js'))) return 'node dist/index.js';
+  if (fs.existsSync(path.join(projectDir, 'server_dist', 'index.js'))) return 'node server_dist/index.js';
   if (fs.existsSync(path.join(projectDir, 'index.js'))) return 'node index.js';
   return null;
 };
@@ -197,6 +260,7 @@ const writePm2StarterScript = (safeName, projectDir, innerCommand) => {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const scriptPath = path.join(dir, `${safeName}.sh`);
   const cdPath = shSingleQuote(projectDir);
+  const pnpmBootstrap = projectUsesPnpm(projectDir) ? `${preparePnpmShell}\n` : '';
   const body = `#!/usr/bin/env bash
 set -e
 export HOME=${shSingleQuote(path.join('/home', APP_USER))}
@@ -206,7 +270,7 @@ cd ${cdPath}
 set -a
 [ -f .env ] && . ./.env
 set +a
-exec ${innerCommand}
+${pnpmBootstrap}exec ${innerCommand}
 `;
   fs.writeFileSync(scriptPath, body, { mode: 0o700 });
   run(`chown ${APP_USER}:${APP_USER} ${shSingleQuote(scriptPath)}`);
@@ -505,11 +569,65 @@ const getSslExpiryIso = (host) => {
   }
 };
 
+const getServerPublicIpv4 = () => {
+  const fromEnv = String(process.env.VPS_PUBLIC_IP || '').trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const out = execSync("hostname -I | awk '{print $1}'", { encoding: 'utf8' }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+};
+
+const resolveHostAddresses = async (host) => {
+  const ips = new Set();
+  for (const resolver of [dns.resolve4, dns.resolve6]) {
+    try {
+      const rows = await resolver(host);
+      for (const row of rows) ips.add(String(row));
+    } catch (e) {
+      if (e && e.code !== 'ENODATA' && e.code !== 'ENOTFOUND') throw e;
+    }
+  }
+  return [...ips];
+};
+
+const assertSslDnsPointsToServer = async (host) => {
+  const serverIp = getServerPublicIpv4();
+  const addresses = await resolveHostAddresses(host);
+  if (!addresses.length) {
+    throw new Error(`DNS untuk ${host} belum terpasang (tidak ada record A/AAAA).`);
+  }
+  if (serverIp && !addresses.includes(serverIp)) {
+    throw new Error(
+      `DNS ${host} mengarah ke ${addresses.join(', ')}, bukan IP VPS ${serverIp}. `
+      + 'Jika memakai Cloudflare, matikan proxied (grey cloud) sampai sertifikat terpasang, lalu aktifkan TLS Full (strict).',
+    );
+  }
+};
+
 const runCertbotNginx = (host) => {
-  execSync(
-    `sudo -n certbot --nginx -d ${host} --non-interactive --agree-tos --redirect`,
-    { encoding: 'utf8', stdio: 'pipe', maxBuffer: 20 * 1024 * 1024 },
-  );
+  try {
+    execSync(
+      `sudo -n certbot --nginx -d ${host} --non-interactive --agree-tos --redirect`,
+      { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 20 * 1024 * 1024 },
+    );
+  } catch (e) {
+    const detail = String(e.stderr || e.stdout || e.message || e);
+    if (/Invalid response from .*acme-challenge/i.test(detail)) {
+      throw new Error(
+        'Validasi Let\'s Encrypt gagal: respons challenge HTTP bukan dari VPS. '
+        + 'Periksa Cloudflare proxy (DNS only saat pasang SSL) dan pastikan Nginx port 80 dapat dijangkau.',
+      );
+    }
+    if (/Some challenges have failed/i.test(detail)) {
+      throw new Error(
+        'Let\'s Encrypt menolak domain. Pastikan DNS sudah mengarah ke IP VPS (tanpa proxy Cloudflare) sebelum memasang SSL.',
+      );
+    }
+    throw new Error(detail.trim().split('\n').slice(-6).join('\n') || 'certbot gagal');
+  }
 };
 
 const certbotDeleteCert = (host) => {
@@ -646,7 +764,7 @@ app.post('/api/projects/install', auth, (req, res) => {
     if (err) return res.status(500).json({ error: 'Clone failed: ' + err.message });
 
     try {
-      runAsThrow(`cd ${shSingleQuote(targetDir)} && npm install`);
+      runProjectDepsInstall(targetDir);
     } catch (e) {
       return res.status(500).json({ error: 'Install failed: ' + e.message });
     }
@@ -663,10 +781,11 @@ app.post('/api/projects/install', auth, (req, res) => {
 
     // Setup nginx if domain
     if (domain) {
-      const nginx = `server {\n    listen 80;\n    server_name ${domain};\n    location / {\n        proxy_pass http://127.0.0.1:${port};\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection 'upgrade';\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_cache_bypass $http_upgrade;\n    }\n}\n`;
-      fs.writeFileSync(`/etc/nginx/sites-available/${name}`, nginx);
-      run(`ln -sf /etc/nginx/sites-available/${name} /etc/nginx/sites-enabled/${name}`);
-      run('nginx -t && systemctl reload nginx');
+      try {
+        applyProjectNginxSite(name, domain, port);
+      } catch (e) {
+        return res.status(500).json({ error: 'Nginx gagal: ' + (e.message || String(e)) });
+      }
     }
 
     try {
@@ -706,8 +825,7 @@ app.post('/api/projects/:name/deploy', auth, (req, res) => {
   exec(`sudo -u ${APP_USER} git -C ${dirQ} fetch --all && sudo -u ${APP_USER} git -C ${dirQ} reset --hard origin/${branch}`, (err) => {
     if (err) return res.status(500).json({ error: err.message });
     try {
-      // Full install (not --only=production) so devDependencies (tsx, vite, etc.) exist for build
-      runAsThrow(`cd ${dirQ} && npm install`);
+      runProjectDepsInstall(dir);
       runProjectBuildIfAny(dir);
       refreshPm2StarterScript(name, dir);
       pm2RestartWithEnvFromProject(name);
@@ -946,11 +1064,12 @@ app.delete('/api/domains/:id', auth, (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/domains/:id/ssl', auth, (req, res) => {
+app.post('/api/domains/:id/ssl', auth, async (req, res) => {
   const db = loadDomainsDb();
   const d = db.domains.find((x) => x.id === req.params.id);
   if (!d) return res.status(404).json({ error: 'Tidak ditemukan' });
   try {
+    await assertSslDnsPointsToServer(d.host);
     if (!d.externalNginx) applyManagedDomainNginx(d);
     runCertbotNginx(d.host);
     d.ssl = true;
@@ -1681,7 +1800,38 @@ app.get('/', (req, res) => {
   .db-spinner { width: 20px; height: 20px; border: 2px solid var(--border); border-top-color: var(--blue); border-radius: 50%; animation: dbSpin 0.65s linear infinite; flex-shrink: 0; margin-top: 2px; }
   @keyframes dbSpin { to { transform: rotate(360deg); } }
   .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .btn.is-busy { position: relative; color: transparent !important; pointer-events: none; }
+  .btn.is-busy::after { content: ''; position: absolute; inset: 0; margin: auto; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: dbSpin 0.65s linear infinite; }
+  .btn:not(.btn-primary):not(.btn-danger).is-busy::after { border-color: rgba(201,209,217,.35); border-top-color: var(--text); }
+  .btn-danger.is-busy::after { border-color: rgba(248,81,73,.35); border-top-color: var(--red); }
   .uninstall-verify-code { font-family: monospace; font-size: 22px; font-weight: 600; letter-spacing: 0.25em; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; text-align: center; color: var(--accent); user-select: all; }
+  .sidebar-shell { display: flex; flex-direction: column; height: 100%; }
+  .sidebar-footer { margin-top: auto; padding: 16px 20px 0; border-top: 1px solid var(--border); }
+  .sidebar-footer .btn { width: 100%; justify-content: center; }
+  .mobile-topbar { display: none; position: sticky; top: 0; z-index: 90; align-items: center; gap: 12px; padding: 12px 16px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+  .mobile-menu-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg3); color: var(--text); cursor: pointer; }
+  .mobile-topbar-title { font-size: 15px; font-weight: 600; }
+  .sidebar-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 95; }
+  .table-scroll { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .page-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .page-header h2 { margin: 0; }
+  .account-card { max-width: 480px; }
+  @media (max-width: 900px) {
+    .sidebar { width: min(280px, 86vw); transform: translateX(-100%); transition: transform .2s ease; z-index: 100; box-shadow: 8px 0 24px rgba(0,0,0,.35); }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-overlay.open { display: block; }
+    .main { margin-left: 0; padding: 16px; }
+    .mobile-topbar { display: flex; }
+    .form-grid { grid-template-columns: 1fr; }
+    .login-card { width: min(340px, calc(100vw - 32px)); padding: 24px; }
+    .toast { left: 16px; right: 16px; bottom: 16px; max-width: none; }
+    .db-toolbar { flex-direction: column; align-items: stretch; }
+    .db-toolbar-actions { width: 100%; }
+    .db-toolbar-actions .btn { flex: 1 1 auto; }
+    th, td { padding: 10px 8px; font-size: 12px; }
+    .btn-group { gap: 4px; }
+    .modal { padding: 20px; }
+  }
 </style>
 </head>
 <body>
@@ -1692,19 +1842,27 @@ app.get('/', (req, res) => {
         <h2 style="text-align:center; margin-bottom:8px;">VPS Manager</h2>
         <p style="text-align:center; color:var(--muted); font-size:13px; margin-bottom:24px;">Dashboard Panel</p>
         <div class="form-row"><label>Password</label><input type="password" id="login-pass" placeholder="Enter password" /></div>
-        <button class="btn btn-primary" style="width:100%;" onclick="doLogin()">Login</button>
+        <button class="btn btn-primary" style="width:100%;" onclick="doLogin(event)">Login</button>
         <div id="login-err" style="color:var(--red); font-size:12px; margin-top:10px; text-align:center;"></div>
       </div>
     </div>
   </div>
 
   <div id="dashboard" style="display:none;">
-    <div class="sidebar">
-      <div class="logo">
-        <h1>⚡ VPS Manager</h1>
-        <p id="vps-ip">Loading...</p>
-      </div>
-      <nav class="nav">
+    <div class="mobile-topbar">
+      <button type="button" class="mobile-menu-btn" onclick="toggleMobileNav()" aria-label="Buka menu">
+        <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor"><path d="M1 2.75A.75.75 0 0 1 1.75 2h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 2.75zm0 5A.75.75 0 0 1 1.75 7h12.5a.75.75 0 0 1 0 1.5H1.75A.75.75 0 0 1 1 7.75zM1.75 12h12.5a.75.75 0 0 1 0 1.5H1.75a.75.75 0 0 1 0-1.5z"/></svg>
+      </button>
+      <div class="mobile-topbar-title">VPS Manager</div>
+    </div>
+    <div class="sidebar-overlay" id="sidebar-overlay" onclick="closeMobileNav()"></div>
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-shell">
+        <div class="logo">
+          <h1>⚡ VPS Manager</h1>
+          <p id="vps-ip">Loading...</p>
+        </div>
+        <nav class="nav">
         <a href="#" class="active" onclick="showPage('overview')">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 1.5A1.5 1.5 0 0 1 1.5 0h2A1.5 1.5 0 0 1 5 1.5v2A1.5 1.5 0 0 1 3.5 5h-2A1.5 1.5 0 0 1 0 3.5v-2zM6.5 0A1.5 1.5 0 0 0 5 1.5v2A1.5 1.5 0 0 0 6.5 5h2A1.5 1.5 0 0 0 10 3.5v-2A1.5 1.5 0 0 0 8.5 0h-2zM11 1.5A1.5 1.5 0 0 1 12.5 0h2A1.5 1.5 0 0 1 16 1.5v2A1.5 1.5 0 0 1 14.5 5h-2A1.5 1.5 0 0 1 11 3.5v-2zM1.5 6a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 1.5 11h2A1.5 1.5 0 0 0 5 9.5v-2A1.5 1.5 0 0 0 3.5 6h-2zM6.5 6A1.5 1.5 0 0 0 5 7.5v2A1.5 1.5 0 0 0 6.5 11h2A1.5 1.5 0 0 0 10 9.5v-2A1.5 1.5 0 0 0 8.5 6h-2zM11 7.5A1.5 1.5 0 0 1 12.5 6h2A1.5 1.5 0 0 1 16 7.5v2A1.5 1.5 0 0 1 14.5 11h-2A1.5 1.5 0 0 1 11 9.5v-2zM1.5 11A1.5 1.5 0 0 0 0 12.5v2A1.5 1.5 0 0 0 1.5 16h2A1.5 1.5 0 0 0 5 14.5v-2A1.5 1.5 0 0 0 3.5 11h-2zM6.5 11A1.5 1.5 0 0 0 5 12.5v2A1.5 1.5 0 0 0 6.5 16h2A1.5 1.5 0 0 0 10 14.5v-2A1.5 1.5 0 0 0 8.5 11h-2zM11 12.5a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v2a1.5 1.5 0 0 1-1.5 1.5h-2a1.5 1.5 0 0 1-1.5-1.5v-2z"/></svg>
           Overview
@@ -1729,7 +1887,15 @@ app.get('/', (req, res) => {
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1a2 2 0 0 0-2 2v1h10V3a2 2 0 0 0-2-2H5zm6 8H5a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2z"/><path d="M0 7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2h-1v-1a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v1H2a2 2 0 0 1-2-2V7z"/></svg>
           Logs
         </a>
+        <a href="#" onclick="showPage('account')">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm4 8c0 1-1 1-1 1H3s-1 0-1-1 1-4 6-4 6 3 6 4Zm-1-.004c-.001-.246-.154-.986-.832-1.664C11.516 10.68 10.289 10 8 10c-2.29 0-3.516.68-4.168 1.332-.678.678-.83 1.418-.832 1.664h10Z"/></svg>
+          Akun
+        </a>
       </nav>
+      <div class="sidebar-footer">
+        <button type="button" class="btn btn-danger" onclick="doLogout()">Keluar</button>
+      </div>
+      </div>
     </div>
 
     <main class="main">
@@ -1739,8 +1905,10 @@ app.get('/', (req, res) => {
         <div class="grid" id="sys-stats"></div>
         <div class="card">
           <h3 style="margin-bottom:16px;font-size:15px;">Running Projects</h3>
+          <div class="table-scroll">
           <table><thead><tr><th>App</th><th>Status</th><th>Port</th><th>Domain</th><th>CPU</th><th>RAM</th><th>Actions</th></tr></thead>
           <tbody id="overview-table"><tr><td colspan="7" style="color:var(--muted);text-align:center;">Loading...</td></tr></tbody></table>
+          </div>
         </div>
       </div>
 
@@ -1762,21 +1930,23 @@ app.get('/', (req, res) => {
           </div>
           <div style="display:flex;flex-direction:column;gap:10px;align-items:flex-end;">
             <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer;">
-              <input type="checkbox" id="certbot-autorenew-global" style="width:auto;" onchange="toggleCertbotAutoRenew()" />
+              <input type="checkbox" id="certbot-autorenew-global" style="width:auto;" onchange="toggleCertbotAutoRenew(event)" />
               Auto-renew SSL (aktifkan timer certbot)
             </label>
             <span id="certbot-timer-status" style="font-size:12px;color:var(--muted);"></span>
             <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;">
-              <button type="button" class="btn" onclick="importExistingDomains()" title="Baca /etc/nginx/sites-enabled">Impor dari nginx</button>
+              <button type="button" class="btn" onclick="importExistingDomains(event)" title="Baca /etc/nginx/sites-enabled">Impor dari nginx</button>
               <button type="button" class="btn btn-primary" onclick="showDomainModal(null)">+ Tambah domain</button>
             </div>
           </div>
         </div>
         <div class="card" style="padding:0;overflow:hidden;">
+          <div class="table-scroll">
           <table style="margin:0;">
             <thead><tr><th style="padding-left:18px;">Host</th><th>Pointing</th><th>Port</th><th>SSL</th><th>Kadaluarsa</th><th style="text-align:right;padding-right:18px;">Aksi</th></tr></thead>
             <tbody id="domains-table-body"><tr><td colspan="6" style="padding:24px;color:var(--muted);text-align:center;">Memuat…</td></tr></tbody>
           </table>
+          </div>
         </div>
       </div>
 
@@ -1894,6 +2064,20 @@ app.get('/', (req, res) => {
         </div>
         <div class="logs-box" id="logs-output">Pilih project dan klik Load Logs.</div>
       </div>
+
+      <!-- ACCOUNT -->
+      <div id="page-account" class="page">
+        <h2>Pengaturan Akun</h2>
+        <div class="card account-card">
+          <h3 style="margin-bottom:16px;font-size:15px;">Ubah sandi dashboard</h3>
+          <p style="color:var(--muted);font-size:13px;line-height:1.5;margin-bottom:18px;">Sandi baru disimpan di server dan dipakai untuk login berikutnya.</p>
+          <div class="form-row"><label>Sandi saat ini</label><input type="password" id="account-current-pass" autocomplete="current-password" /></div>
+          <div class="form-row"><label>Sandi baru</label><input type="password" id="account-new-pass" autocomplete="new-password" /></div>
+          <div class="form-row"><label>Ulangi sandi baru</label><input type="password" id="account-confirm-pass" autocomplete="new-password" /></div>
+          <div id="account-pass-err" style="color:var(--red);font-size:12px;margin-bottom:12px;"></div>
+          <button type="button" class="btn btn-primary" onclick="changeAccountPassword(event)">Simpan sandi</button>
+        </div>
+      </div>
     </main>
   </div>
 </div>
@@ -1913,7 +2097,7 @@ app.get('/', (req, res) => {
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;">
       <button class="btn" onclick="closeModal()">Batal</button>
-      <button class="btn btn-primary" onclick="installProject()">Install</button>
+      <button class="btn btn-primary" onclick="installProject(event)">Install</button>
     </div>
     <div id="install-progress" style="display:none;margin-top:16px;">
       <div style="color:var(--muted);font-size:12px;">Menginstall...</div>
@@ -1967,7 +2151,7 @@ app.get('/', (req, res) => {
     <p style="font-size:12px;color:var(--muted);line-height:1.5;">DNS A/AAAA host harus sudah mengarah ke VPS sebelum pasang SSL.</p>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
       <button type="button" class="btn" onclick="closeDomainModal()">Batal</button>
-      <button type="button" class="btn btn-primary" onclick="saveDomainModal()">Simpan</button>
+      <button type="button" class="btn btn-primary" onclick="saveDomainModal(event)">Simpan</button>
     </div>
   </div>
 </div>
@@ -1984,7 +2168,7 @@ app.get('/', (req, res) => {
     <div class="form-row"><label>Port</label><input id="ps-port" type="number" min="1" max="65535" /></div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
       <button type="button" class="btn" onclick="closeProjectSettingsModal()">Batal</button>
-      <button type="button" class="btn btn-primary" onclick="saveProjectSettings()">Simpan</button>
+      <button type="button" class="btn btn-primary" onclick="saveProjectSettings(event)">Simpan</button>
     </div>
   </div>
 </div>
@@ -2030,7 +2214,35 @@ function api(method, path, body) {
     method,
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
     body: body ? JSON.stringify(body) : undefined
-  }).then(r => r.json());
+  }).then(async r => {
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 401) {
+      doLogout(false);
+      throw new Error(data.error || 'Sesi berakhir');
+    }
+    return data;
+  });
+}
+
+function toggleMobileNav() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebar-overlay').classList.toggle('open');
+}
+
+function closeMobileNav() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebar-overlay').classList.remove('open');
+}
+
+function doLogout(showToast) {
+  token = null;
+  localStorage.removeItem('vps_token');
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'block';
+  document.getElementById('login-pass').value = '';
+  document.getElementById('login-err').textContent = '';
+  closeMobileNav();
+  if (showToast !== false) toast('Anda telah keluar');
 }
 
 function toast(msg, type='success', ms) {
@@ -2040,6 +2252,27 @@ function toast(msg, type='success', ms) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), dur);
+}
+
+function resolveActionButton(ev) {
+  if (!ev) return null;
+  const el = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+  return el || (ev.currentTarget && ev.currentTarget.tagName === 'BUTTON' ? ev.currentTarget : null);
+}
+
+async function withButtonBusy(button, work) {
+  if (!button) {
+    return work();
+  }
+  if (button.disabled || button.classList.contains('is-busy')) return;
+  button.classList.add('is-busy');
+  button.disabled = true;
+  try {
+    return await work();
+  } finally {
+    button.classList.remove('is-busy');
+    button.disabled = false;
+  }
 }
 
 function setImportPanelBusy(busy) {
@@ -2079,17 +2312,19 @@ function showDbJobFinished(ok, htmlInner) {
   el.innerHTML = htmlInner;
 }
 
-async function doLogin() {
-  const pass = document.getElementById('login-pass').value;
-  const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass}) });
-  const data = await res.json();
-  if (data.token) {
-    token = data.token;
-    localStorage.setItem('vps_token', token);
-    initDashboard();
-  } else {
-    document.getElementById('login-err').textContent = 'Password salah!';
-  }
+async function doLogin(ev) {
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    const pass = document.getElementById('login-pass').value;
+    const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass}) });
+    const data = await res.json();
+    if (data.token) {
+      token = data.token;
+      localStorage.setItem('vps_token', token);
+      initDashboard();
+    } else {
+      document.getElementById('login-err').textContent = 'Password salah!';
+    }
+  });
 }
 
 document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
@@ -2100,11 +2335,43 @@ function showPage(name) {
   document.getElementById('page-'+name).classList.add('active');
   const navLink = document.querySelector('.nav a[onclick*="' + name + '"]');
   if (navLink) navLink.classList.add('active');
+  closeMobileNav();
   if(name==='projects') loadProjects();
   if(name==='domains') loadDomainsPage();
   if(name==='secrets') loadSecretsPage();
   if(name==='logs') loadLogsPage();
   if(name==='database') loadDatabasePage();
+}
+
+async function changeAccountPassword(ev) {
+  const errEl = document.getElementById('account-pass-err');
+  errEl.textContent = '';
+  const currentPassword = document.getElementById('account-current-pass').value;
+  const newPassword = document.getElementById('account-new-pass').value;
+  const confirmPassword = document.getElementById('account-confirm-pass').value;
+  if (!currentPassword || !newPassword) {
+    errEl.textContent = 'Isi sandi saat ini dan sandi baru.';
+    return;
+  }
+  if (newPassword.length < 6) {
+    errEl.textContent = 'Sandi baru minimal 6 karakter.';
+    return;
+  }
+  if (newPassword !== confirmPassword) {
+    errEl.textContent = 'Konfirmasi sandi tidak cocok.';
+    return;
+  }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    const data = await api('PUT', '/account/password', { currentPassword, newPassword });
+    if (data.error) {
+      errEl.textContent = data.error;
+      return;
+    }
+    document.getElementById('account-current-pass').value = '';
+    document.getElementById('account-new-pass').value = '';
+    document.getElementById('account-confirm-pass').value = '';
+    toast('Sandi berhasil diubah');
+  });
 }
 
 function statusBadge(s) {
@@ -2141,8 +2408,8 @@ async function loadOverview() {
       <td>\${p.cpu.toFixed(1)}%</td>
       <td>\${fmtBytes(p.memory)}</td>
       <td><div class="btn-group">
-        <button class="btn btn-sm" onclick="deployApp('\${p.name}')">Deploy</button>
-        <button class="btn btn-sm" onclick="restartApp('\${p.name}')">Restart</button>
+        <button class="btn btn-sm" onclick="deployApp('\${p.name}', event)">Deploy</button>
+        <button class="btn btn-sm" onclick="restartApp('\${p.name}', event)">Restart</button>
       </div></td>
     </tr>\`).join('');
 }
@@ -2169,12 +2436,12 @@ async function loadProjects() {
           </div>
           <div class="btn-group">
             <button class="btn btn-sm" onclick="showPage('secrets');document.getElementById('secrets-project-select').value='\${p.name}';loadSecrets()" >Secrets</button>
-            <button class="btn btn-sm" onclick="openProjectSettings(\${JSON.stringify(p.name)})">Pengaturan</button>
+            <button class="btn btn-sm" onclick="openProjectSettings(\${jsQuoted(p.name)})">Pengaturan</button>
             \${p.cicdEnabled
               ? '<span class="chip" title=".github/workflows/deploy.yml">CI/CD aktif</span>'
-              : '<button type="button" class="btn btn-sm" onclick="enableProjectCicd(\\'' + p.name.replace(/'/g, '') + '\\')">Aktifkan CI/CD</button>'}
-            <button class="btn btn-sm" onclick="deployApp('\${p.name}')">Deploy</button>
-            <button class="btn btn-sm" onclick="restartApp('\${p.name}')">Restart</button>
+              : '<button type="button" class="btn btn-sm" onclick="enableProjectCicd(\\'' + p.name.replace(/'/g, '') + '\\', event)">Aktifkan CI/CD</button>'}
+            <button class="btn btn-sm" onclick="deployApp('\${p.name}', event)">Deploy</button>
+            <button class="btn btn-sm" onclick="restartApp('\${p.name}', event)">Restart</button>
             <button class="btn btn-sm" onclick="showLogs('\${p.name}')">Logs</button>
             <button class="btn btn-sm btn-danger" onclick="uninstallApp('\${p.name}')">Uninstall</button>
           </div>
@@ -2192,6 +2459,10 @@ function fillDomainProjectSelect() {
 
 function escapeHtmlAttr(s) {
   return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+}
+
+function jsQuoted(s) {
+  return "'" + String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'") + "'";
 }
 
 function onDomainTargetTypeChange() {
@@ -2232,7 +2503,7 @@ function showDomainModal(editId) {
   document.getElementById('domain-modal').style.display = 'flex';
 }
 
-async function saveDomainModal() {
+async function saveDomainModal(ev) {
   const id = document.getElementById('domain-edit-id').value;
   const host = document.getElementById('domain-input-host').value.trim();
   const tt = document.getElementById('domain-input-target-type').value;
@@ -2244,21 +2515,23 @@ async function saveDomainModal() {
     ssl: document.getElementById('domain-input-ssl').checked,
     sslAutoRenew: document.getElementById('domain-input-autorenew').checked,
   };
-  try {
-    if (id) {
-      const res = await api('PUT', '/domains/' + encodeURIComponent(id), body);
-      if (res.error) { toast(res.error, 'error'); return; }
-    } else {
-      const res = await api('POST', '/domains', body);
-      if (res.error) { toast(res.error, 'error'); return; }
-    }
-    if (body.sslAutoRenew) {
-      await api('PUT', '/settings/certbot-autorenew', { enabled: true });
-    }
-    toast('Domain disimpan');
-    closeDomainModal();
-    loadDomainsPage();
-  } catch (e) { toast('Gagal simpan domain', 'error'); }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    try {
+      if (id) {
+        const res = await api('PUT', '/domains/' + encodeURIComponent(id), body);
+        if (res.error) { toast(res.error, 'error'); return; }
+      } else {
+        const res = await api('POST', '/domains', body);
+        if (res.error) { toast(res.error, 'error'); return; }
+      }
+      if (body.sslAutoRenew) {
+        await api('PUT', '/settings/certbot-autorenew', { enabled: true });
+      }
+      toast('Domain disimpan');
+      closeDomainModal();
+      loadDomainsPage();
+    } catch (e) { toast('Gagal simpan domain', 'error'); }
+  });
 }
 
 async function loadDomainsPage() {
@@ -2283,27 +2556,31 @@ async function loadDomainsPage() {
     const exp = d.sslExpiry ? new Date(d.sslExpiry).toLocaleString() : (d.ssl ? '—' : 'HTTP saja');
     const sslLabel = d.sslActive ? '<span class="badge badge-green">HTTPS</span>' : (d.ssl ? '<span class="badge badge-yellow">Belum terpasang</span>' : '<span class="badge badge-yellow">HTTP</span>');
     return '<tr><td style="padding-left:18px;font-weight:500;">' + escapeHtmlAttr(d.host) + '</td><td>' + extBadge + pt + '</td><td><span class="chip">:' + (d.resolvedPort || '?') + '</span></td><td>' + sslLabel + '</td><td style="font-size:12px;color:var(--muted);">' + exp + '</td><td style="text-align:right;padding-right:18px;"><div class="btn-group">' +
-      '<button type="button" class="btn btn-sm" onclick="showDomainModal(' + JSON.stringify(d.id) + ')">Edit</button>' +
-      '<button type="button" class="btn btn-sm btn-primary" onclick="installSslDomain(' + JSON.stringify(d.id) + ')">SSL</button>' +
-      '<button type="button" class="btn btn-sm btn-danger" onclick="deleteDomain(' + JSON.stringify(d.id) + ',' + JSON.stringify(d.host) + ',' + (d.externalNginx ? 'true' : 'false') + ')">Hapus</button>' +
+      '<button type="button" class="btn btn-sm" onclick="showDomainModal(' + jsQuoted(d.id) + ')">Edit</button>' +
+      '<button type="button" class="btn btn-sm btn-primary" onclick="installSslDomain(' + jsQuoted(d.id) + ', event)">SSL</button>' +
+      '<button type="button" class="btn btn-sm btn-danger" onclick="deleteDomain(' + jsQuoted(d.id) + ',' + jsQuoted(d.host) + ',' + (d.externalNginx ? 'true' : 'false') + ', event)">Hapus</button>' +
       '</div></td></tr>';
   }).join('');
 }
 
-async function importExistingDomains() {
+async function importExistingDomains(ev) {
   if (!confirm('Pindai /etc/nginx/sites-enabled dan tambahkan host baru ke daftar?\\n\\nFile site selain vps-domain-* akan ditandai sebagai nginx manual (panel tidak menghapus berkas nginx saat Hapus).')) return;
-  try {
-    const res = await api('POST', '/domains/import-existing', {});
-    if (res.error) { toast(res.error, 'error'); return; }
-    const n = (res.added || []).length;
-    const sk = (res.skipped || []).length;
-    toast('Impor: +' + n + ' domain, lewati ' + sk + ' (sudah ada)');
-    loadDomainsPage();
-  } catch (e) { toast('Impor gagal', 'error'); }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    try {
+      const res = await api('POST', '/domains/import-existing', {});
+      if (res.error) { toast(res.error, 'error'); return; }
+      const n = (res.added || []).length;
+      const sk = (res.skipped || []).length;
+      toast('Impor: +' + n + ' domain, lewati ' + sk + ' (sudah ada)');
+      loadDomainsPage();
+    } catch (e) { toast('Impor gagal', 'error'); }
+  });
 }
 
-async function toggleCertbotAutoRenew() {
+async function toggleCertbotAutoRenew(ev) {
   const on = document.getElementById('certbot-autorenew-global').checked;
+  const input = ev && ev.target ? ev.target : document.getElementById('certbot-autorenew-global');
+  if (input) input.disabled = true;
   try {
     const res = await api('PUT', '/settings/certbot-autorenew', { enabled: on });
     if (res.error) { toast(res.error, 'error'); return; }
@@ -2312,28 +2589,34 @@ async function toggleCertbotAutoRenew() {
   } catch (e) {
     toast('Gagal ubah timer certbot (perlu sudo)', 'error');
     loadDomainsPage();
+  } finally {
+    if (input) input.disabled = false;
   }
 }
 
-async function installSslDomain(id) {
-  try {
-    const res = await api('POST', '/domains/' + encodeURIComponent(id) + '/ssl');
-    if (res.error) { toast(res.error, 'error'); return; }
-    toast('SSL terpasang');
-    loadDomainsPage();
-  } catch (e) { toast('SSL gagal', 'error'); }
+async function installSslDomain(id, ev) {
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    try {
+      const res = await api('POST', '/domains/' + encodeURIComponent(id) + '/ssl');
+      if (res.error) { toast(res.error, 'error', 8000); return; }
+      toast('SSL terpasang');
+      loadDomainsPage();
+    } catch (e) { toast(e.message || 'SSL gagal', 'error', 8000); }
+  });
 }
 
-async function deleteDomain(id, hostHint, externalOnly) {
+async function deleteDomain(id, hostHint, externalOnly, ev) {
   const msg = externalOnly
     ? 'Hapus "' + (hostHint || id) + '" dari daftar panel saja? Berkas nginx & sertifikat di server tidak diubah.'
     : 'Hapus domain ' + (hostHint || id) + '? Nginx & sertifikat terkait akan dihapus.';
   if (!confirm(msg)) return;
-  try {
-    await api('DELETE', '/domains/' + encodeURIComponent(id));
-    toast('Domain dihapus');
-    loadDomainsPage();
-  } catch (e) { toast('Gagal hapus', 'error'); }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    try {
+      await api('DELETE', '/domains/' + encodeURIComponent(id));
+      toast('Domain dihapus');
+      loadDomainsPage();
+    } catch (e) { toast('Gagal hapus', 'error'); }
+  });
 }
 
 function openProjectSettings(name) {
@@ -2350,25 +2633,27 @@ function closeProjectSettingsModal() {
   document.getElementById('project-settings-modal').style.display = 'none';
 }
 
-async function saveProjectSettings() {
+async function saveProjectSettings(ev) {
   const cur = document.getElementById('ps-current-name').value;
   const newName = document.getElementById('ps-new-name').value.trim();
   const domain = document.getElementById('ps-domain').value.trim();
   const port = document.getElementById('ps-port').value;
   const body = { domain, port };
   if (newName) body.newName = newName;
-  try {
-    const res = await api('PATCH', '/projects/' + encodeURIComponent(cur) + '/settings', body);
-    if (res.error) { toast(res.error, 'error'); return; }
-    toast('Pengaturan disimpan');
-    closeProjectSettingsModal();
-    if (res.name && res.name !== cur) {
-      toast('Nama project sekarang: ' + res.name);
-    }
-    loadOverview();
-    loadProjects();
-    loadDomainsPage();
-  } catch (e) { toast('Gagal simpan pengaturan', 'error'); }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    try {
+      const res = await api('PATCH', '/projects/' + encodeURIComponent(cur) + '/settings', body);
+      if (res.error) { toast(res.error, 'error'); return; }
+      toast('Pengaturan disimpan');
+      closeProjectSettingsModal();
+      if (res.name && res.name !== cur) {
+        toast('Nama project sekarang: ' + res.name);
+      }
+      loadOverview();
+      loadProjects();
+      loadDomainsPage();
+    } catch (e) { toast('Gagal simpan pengaturan', 'error'); }
+  });
 }
 
 function showInstallModal() {
@@ -2390,7 +2675,7 @@ document.getElementById('i-repo').addEventListener('blur', function() {
   }
 });
 
-async function installProject() {
+async function installProject(ev) {
   const body = {
     repoUrl: document.getElementById('i-repo').value.trim(),
     name: document.getElementById('i-name').value.trim(),
@@ -2400,13 +2685,15 @@ async function installProject() {
   };
   if(!body.repoUrl || !body.name || !body.port) { toast('Isi semua field wajib!','error'); return; }
 
-  document.getElementById('install-progress').style.display = 'block';
-  try {
-    const res = await api('POST','/projects/install', body);
-    if(res.error) { toast(res.error,'error'); }
-    else { toast('Project berhasil diinstall!'); closeModal(); loadOverview(); loadProjects(); }
-  } catch(e) { toast('Install gagal!','error'); }
-  document.getElementById('install-progress').style.display = 'none';
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    document.getElementById('install-progress').style.display = 'block';
+    try {
+      const res = await api('POST','/projects/install', body);
+      if(res.error) { toast(res.error,'error'); }
+      else { toast('Project berhasil diinstall!'); closeModal(); loadOverview(); loadProjects(); }
+    } catch(e) { toast(e.message || 'Install gagal!', 'error'); }
+    document.getElementById('install-progress').style.display = 'none';
+  });
 }
 
 function closeUninstallVerifyModal() {
@@ -2459,24 +2746,30 @@ async function confirmUninstallProject() {
   }
 }
 
-async function deployApp(name) {
-  toast(\`Deploying \${name}...\`);
-  const res = await api('POST',\`/projects/\${name}/deploy\`);
-  if(res.error) toast(res.error,'error');
-  else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); }
+async function deployApp(name, ev) {
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    const res = await api('POST',\`/projects/\${name}/deploy\`);
+    if(res.error) toast(res.error,'error');
+    else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); loadProjects(); }
+  });
 }
 
-async function enableProjectCicd(name) {
+async function enableProjectCicd(name, ev) {
   if (!confirm('Membuat .github/workflows/deploy.yml (dari template manager), lalu git add ., commit, dan push ke remote. Lanjut?')) return;
-  const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
-  if (data.error) toast(data.error, 'error');
-  else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
+    if (data.error) toast(data.error, 'error');
+    else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+  });
 }
 
-async function restartApp(name) {
-  await api('POST',\`/projects/\${name}/restart\`);
-  toast(\`\${name} direstart!\`);
-  loadOverview();
+async function restartApp(name, ev) {
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    await api('POST',\`/projects/\${name}/restart\`);
+    toast(\`\${name} direstart!\`);
+    loadOverview();
+    loadProjects();
+  });
 }
 
 // SECRETS
@@ -2503,8 +2796,8 @@ async function loadSecrets() {
         \${secrets.map(s => secretRow(s.key, s.value)).join('')}
       </div>
       <div style="margin-top:16px;display:flex;gap:8px;">
-        <button class="btn btn-primary" onclick="saveSecrets()">Simpan & Restart</button>
-        <button class="btn" onclick="saveSecrets(false)">Simpan (tanpa restart)</button>
+        <button class="btn btn-primary" onclick="saveSecrets(true, event)">Simpan & Restart</button>
+        <button class="btn" onclick="saveSecrets(false, event)">Simpan (tanpa restart)</button>
       </div>
     </div>
   \`;
@@ -2523,7 +2816,7 @@ function addSecretRow() {
   document.getElementById('secrets-rows').insertAdjacentHTML('beforeend', secretRow());
 }
 
-async function saveSecrets(restart=true) {
+async function saveSecrets(restart=true, ev) {
   const app = document.getElementById('secrets-project-select').value;
   const rows = document.querySelectorAll('.secret-row');
   const secrets = [];
@@ -2532,9 +2825,11 @@ async function saveSecrets(restart=true) {
     const val = row.querySelector('.secret-val').value;
     if(key) secrets.push({key, value: val});
   });
-  await api('PUT', \`/projects/\${app}/secrets\`, {secrets});
-  if(restart) await api('POST', \`/projects/\${app}/restart\`);
-  toast('Secrets disimpan!' + (restart?' App direstart!':''));
+  await withButtonBusy(resolveActionButton(ev), async () => {
+    await api('PUT', \`/projects/\${app}/secrets\`, {secrets});
+    if(restart) await api('POST', \`/projects/\${app}/restart\`);
+    toast('Secrets disimpan!' + (restart?' App direstart!':''));
+  });
 }
 
 // LOGS
