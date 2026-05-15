@@ -1786,7 +1786,7 @@ app.post('/api/database/sync-from-url', auth, jsonLarge, async (req, res) => {
 });
 
 // ── SERVE DASHBOARD ───────────────────────────────────────────
-app.get('/', (req, res) => {
+const sendDashboard = (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1960,31 +1960,31 @@ app.get('/', (req, res) => {
           <p id="vps-ip">Loading...</p>
         </div>
         <nav class="nav">
-        <a href="#" class="active" onclick="showPage('overview')">
+        <a href="#overview" class="active" onclick="showPage('overview');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 1.5A1.5 1.5 0 0 1 1.5 0h2A1.5 1.5 0 0 1 5 1.5v2A1.5 1.5 0 0 1 3.5 5h-2A1.5 1.5 0 0 1 0 3.5v-2zM6.5 0A1.5 1.5 0 0 0 5 1.5v2A1.5 1.5 0 0 0 6.5 5h2A1.5 1.5 0 0 0 10 3.5v-2A1.5 1.5 0 0 0 8.5 0h-2zM11 1.5A1.5 1.5 0 0 1 12.5 0h2A1.5 1.5 0 0 1 16 1.5v2A1.5 1.5 0 0 1 14.5 5h-2A1.5 1.5 0 0 1 11 3.5v-2zM1.5 6a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 1.5 11h2A1.5 1.5 0 0 0 5 9.5v-2A1.5 1.5 0 0 0 3.5 6h-2zM6.5 6A1.5 1.5 0 0 0 5 7.5v2A1.5 1.5 0 0 0 6.5 11h2A1.5 1.5 0 0 0 10 9.5v-2A1.5 1.5 0 0 0 8.5 6h-2zM11 7.5A1.5 1.5 0 0 1 12.5 6h2A1.5 1.5 0 0 1 16 7.5v2A1.5 1.5 0 0 1 14.5 11h-2A1.5 1.5 0 0 1 11 9.5v-2zM1.5 11A1.5 1.5 0 0 0 0 12.5v2A1.5 1.5 0 0 0 1.5 16h2A1.5 1.5 0 0 0 5 14.5v-2A1.5 1.5 0 0 0 3.5 11h-2zM6.5 11A1.5 1.5 0 0 0 5 12.5v2A1.5 1.5 0 0 0 6.5 16h2A1.5 1.5 0 0 0 10 14.5v-2A1.5 1.5 0 0 0 8.5 11h-2zM11 12.5a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v2a1.5 1.5 0 0 1-1.5 1.5h-2a1.5 1.5 0 0 1-1.5-1.5v-2z"/></svg>
           Overview
         </a>
-        <a href="#" onclick="showPage('projects')">
+        <a href="#projects" onclick="showPage('projects');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707l-6.45 6.449a.5.5 0 0 1-.354.147H2.5a.5.5 0 0 1-.5-.5v-5.65a.5.5 0 0 1 .146-.354l6.449-6.45a.5.5 0 0 1 .233-.145z"/></svg>
           Projects
         </a>
-        <a href="#" onclick="showPage('domains')">
+        <a href="#domains" onclick="showPage('domains');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4Zm2-1a1 1 0 0 0-1 1v.217l7 4.2 7-4.2V4a1 1 0 0 0-1-1H2Zm13 2.383-4.708 2.825L15 11.105V5.383Zm-.034 6.876-5.64-3.471L8 9.583l-1.326-.795-5.64 3.47A1 1 0 0 0 2 13h12a1 1 0 0 0 .966-.741ZM1 11.105l4.708-2.897L1 5.383v5.722Z"/></svg>
           Domain
         </a>
-        <a href="#" onclick="showPage('secrets')">
+        <a href="#secrets" onclick="showPage('secrets');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
           Secrets
         </a>
-        <a href="#" onclick="showPage('database')">
+        <a href="#database" onclick="showPage('database');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h11A1.5 1.5 0 0 1 15 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9zM2.5 3a.5.5 0 0 0-.5.5V6h12V3.5a.5.5 0 0 0-.5-.5h-11zm12 4H2v5.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5V7z"/></svg>
           Database
         </a>
-        <a href="#" onclick="showPage('logs')">
+        <a href="#logs" onclick="showPage('logs');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1a2 2 0 0 0-2 2v1h10V3a2 2 0 0 0-2-2H5zm6 8H5a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2z"/><path d="M0 7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2h-1v-1a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v1H2a2 2 0 0 1-2-2V7z"/></svg>
           Logs
         </a>
-        <a href="#" onclick="showPage('account')">
+        <a href="#account" onclick="showPage('account');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm4 8c0 1-1 1-1 1H3s-1 0-1-1 1-4 6-4 6 3 6 4Zm-1-.004c-.001-.246-.154-.986-.832-1.664C11.516 10.68 10.289 10 8 10c-2.29 0-3.516.68-4.168 1.332-.678.678-.83 1.418-.832 1.664h10Z"/></svg>
           Akun
         </a>
@@ -2305,6 +2305,7 @@ let token = localStorage.getItem('vps_token');
 let projects = [];
 let uninstallVerifyCode = '';
 let uninstallPendingName = '';
+const ROUTE_PAGES = ['overview', 'projects', 'domains', 'secrets', 'database', 'logs', 'account'];
 
 function api(method, path, body) {
   return fetch('/api' + path, {
@@ -2426,19 +2427,40 @@ async function doLogin(ev) {
 
 document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
 
-function showPage(name) {
+function pageFromLocation() {
+  const hash = window.location.hash.replace(/^#\\/?/, '').split(/[\\/?]/)[0];
+  if (ROUTE_PAGES.includes(hash)) return hash;
+  const path = window.location.pathname.replace(/^\\/+|\\/+$/g, '');
+  if (ROUTE_PAGES.includes(path)) return path;
+  return 'overview';
+}
+
+function setRoute(name) {
+  const next = name === 'overview' ? '/' : '/#' + name;
+  if ((window.location.pathname + window.location.hash) !== next) {
+    history.pushState(null, '', next);
+  }
+}
+
+function showPage(name, opts) {
+  if (!ROUTE_PAGES.includes(name)) name = 'overview';
+  opts = opts || {};
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
   const navLink = document.querySelector('.nav a[onclick*="' + name + '"]');
   if (navLink) navLink.classList.add('active');
   closeMobileNav();
+  if (opts.updateRoute !== false) setRoute(name);
   if(name==='projects') loadProjects();
   if(name==='domains') loadDomainsPage();
   if(name==='secrets') loadSecretsPage();
   if(name==='logs') loadLogsPage();
   if(name==='database') loadDatabasePage();
 }
+
+window.addEventListener('hashchange', () => showPage(pageFromLocation(), { updateRoute: false }));
+window.addEventListener('popstate', () => showPage(pageFromLocation(), { updateRoute: false }));
 
 async function changeAccountPassword(ev) {
   const errEl = document.getElementById('account-pass-err');
@@ -3365,6 +3387,7 @@ async function initDashboard() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   await loadOverview();
+  showPage(pageFromLocation(), { updateRoute: false });
   setInterval(loadOverview, 10000);
 }
 
@@ -3374,7 +3397,10 @@ else { document.getElementById('login-screen').style.display = 'block'; }
 </script>
 </body>
 </html>`);
-});
+};
+
+app.get('/', sendDashboard);
+app.get(/^\/(overview|projects|domains|secrets|database|logs|account)\/?$/, sendDashboard);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`VPS Manager Dashboard running on http://0.0.0.0:${PORT}`);
