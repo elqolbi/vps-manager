@@ -1834,6 +1834,20 @@ app.get('/', (req, res) => {
   .btn-danger { background: rgba(248,81,73,.1); border-color: var(--red); color: var(--red); }
   .btn-sm { padding: 4px 10px; font-size: 12px; }
   .btn-group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .project-list-card { position: relative; display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 18px 20px; }
+  .project-info { min-width: 0; flex: 1 1 auto; }
+  .project-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .project-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .project-meta { font-size: 12px; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+  .project-actions { position: relative; flex: 0 0 auto; margin-left: auto; }
+  .project-menu-btn { width: 36px; height: 36px; padding: 0; justify-content: center; font-size: 20px; line-height: 1; }
+  .project-menu { display: none; position: absolute; top: calc(100% + 8px); right: 0; min-width: 190px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); box-shadow: 0 12px 30px rgba(0,0,0,.35); z-index: 30; }
+  .project-actions.open .project-menu { display: block; }
+  .project-menu-item, .project-menu-note { width: 100%; display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 9px 10px; border-radius: 6px; border: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; text-align: left; text-decoration: none; cursor: pointer; }
+  .project-menu-item:hover { background: var(--bg3); color: var(--blue); }
+  .project-menu-item.btn-danger { color: var(--red); }
+  .project-menu-item.btn-danger:hover { background: rgba(248,81,73,.1); color: var(--red); }
+  .project-menu-note { color: var(--muted); cursor: default; }
   input, select, textarea { background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; width: 100%; outline: none; font-family: inherit; }
   input:focus, select:focus, textarea:focus { border-color: var(--accent); }
   .form-row { margin-bottom: 14px; }
@@ -1911,6 +1925,8 @@ app.get('/', (req, res) => {
     .db-toolbar-actions .btn { flex: 1 1 auto; }
     th, td { padding: 10px 8px; font-size: 12px; }
     .btn-group { gap: 4px; }
+    .project-list-card { padding: 16px; gap: 10px; }
+    .project-menu { min-width: 180px; }
     .modal { padding: 20px; }
   }
 </style>
@@ -2468,7 +2484,15 @@ function fmtBytes(b) {
 function fmtDate(v) {
   if (!v) return '';
   const d = new Date(v);
-  return isNaN(d.getTime()) ? String(v).slice(0, 10) : d.toLocaleDateString();
+  return isNaN(d.getTime())
+    ? String(v).slice(0, 16)
+    : d.toLocaleString('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
 }
 
 function projectDateLine(p) {
@@ -2476,6 +2500,45 @@ function projectDateLine(p) {
   if (p.installedAt) parts.push('installed ' + fmtDate(p.installedAt));
   if (p.updatedAt) parts.push('updated ' + fmtDate(p.updatedAt));
   return parts.length ? ' &nbsp;·&nbsp; ' + parts.join(' &nbsp;·&nbsp; ') : '';
+}
+
+function closeProjectMenus(except) {
+  document.querySelectorAll('.project-actions.open').forEach(function(el) {
+    if (!except || el !== except) el.classList.remove('open');
+  });
+}
+
+function toggleProjectMenu(id, ev) {
+  if (ev) ev.stopPropagation();
+  const box = document.getElementById(id);
+  if (!box) return;
+  const willOpen = !box.classList.contains('open');
+  closeProjectMenus(box);
+  box.classList.toggle('open', willOpen);
+}
+
+document.addEventListener('click', function(ev) {
+  if (!ev.target.closest || !ev.target.closest('.project-actions')) closeProjectMenus();
+});
+
+function projectActionMenu(p, idx) {
+  const menuId = 'project-actions-' + idx;
+  const nameArg = jsQuoted(p.name);
+  const cicdItem = p.cicdEnabled
+    ? '<span class="project-menu-note">CI/CD aktif</span>'
+    : '<button type="button" class="project-menu-item" onclick="enableProjectCicd(' + nameArg + ', event)">Aktifkan CI/CD</button>';
+  return '<div class="project-actions" id="' + menuId + '">' +
+    '<button type="button" class="btn project-menu-btn" aria-label="Aksi project ' + escapeHtmlAttr(p.name) + '" onclick="toggleProjectMenu(' + jsQuoted(menuId) + ', event)">...</button>' +
+    '<div class="project-menu">' +
+      '<button type="button" class="project-menu-item" onclick="showPage(\\'secrets\\');document.getElementById(\\'secrets-project-select\\').value=' + nameArg + ';loadSecrets()">Secrets</button>' +
+      '<button type="button" class="project-menu-item" onclick="openProjectSettings(' + nameArg + ')">Pengaturan</button>' +
+      cicdItem +
+      '<button type="button" class="project-menu-item" onclick="deployApp(' + nameArg + ', event)">Deploy</button>' +
+      '<button type="button" class="project-menu-item" onclick="restartApp(' + nameArg + ', event)">Restart</button>' +
+      '<button type="button" class="project-menu-item" onclick="showLogs(' + nameArg + ')">Logs</button>' +
+      '<button type="button" class="project-menu-item btn-danger" onclick="uninstallApp(' + nameArg + ')">Uninstall</button>' +
+    '</div>' +
+  '</div>';
 }
 
 async function loadOverview() {
@@ -2513,33 +2576,21 @@ async function loadProjects() {
   projects = projs;
   document.getElementById('projects-list').innerHTML = projs.length === 0
     ? '<div style="color:var(--muted);text-align:center;padding:40px;">Belum ada project. Klik "Install Project" untuk mulai.</div>'
-    : projs.map(p => \`
-      <div class="card" style="margin-bottom:12px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
-          <div>
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-              <span style="font-size:15px;font-weight:600;">\${p.name}</span>
+    : projs.map((p, idx) => \`
+      <div class="card project-list-card" style="margin-bottom:12px;">
+          <div class="project-info">
+            <div class="project-title-row">
+              <span class="project-name">\${escapeHtmlAttr(p.name)}</span>
               \${statusBadge(p.status)}
               <span class="chip">:\${p.port}</span>
             </div>
-            <div style="font-size:12px;color:var(--muted);">
+            <div class="project-meta">
               \${p.repo ? '<a href="'+p.repo+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.repo.replace('https://github.com/','')+'</a>' : '-'}
               \${p.domain ? ' &nbsp;·&nbsp; <a href="http://'+p.domain+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.domain+'</a>' : ''}
               \${projectDateLine(p)}
             </div>
           </div>
-          <div class="btn-group">
-            <button class="btn btn-sm" onclick="showPage('secrets');document.getElementById('secrets-project-select').value='\${p.name}';loadSecrets()" >Secrets</button>
-            <button class="btn btn-sm" onclick="openProjectSettings(\${jsQuoted(p.name)})">Pengaturan</button>
-            \${p.cicdEnabled
-              ? '<span class="chip" title=".github/workflows/deploy.yml">CI/CD aktif</span>'
-              : '<button type="button" class="btn btn-sm" onclick="enableProjectCicd(\\'' + p.name.replace(/'/g, '') + '\\', event)">Aktifkan CI/CD</button>'}
-            <button class="btn btn-sm" onclick="deployApp('\${p.name}', event)">Deploy</button>
-            <button class="btn btn-sm" onclick="restartApp('\${p.name}', event)">Restart</button>
-            <button class="btn btn-sm" onclick="showLogs('\${p.name}')">Logs</button>
-            <button class="btn btn-sm btn-danger" onclick="uninstallApp('\${p.name}')">Uninstall</button>
-          </div>
-        </div>
+          \${projectActionMenu(p, idx)}
       </div>
     \`).join('');
 }
