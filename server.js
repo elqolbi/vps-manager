@@ -401,6 +401,28 @@ const getPm2Status = () => {
   } catch { return []; }
 };
 
+const sleepSync = (ms) => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+const assertProjectOnlineAfterDeploy = (name, timeoutMs = 30000) => {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'not_found';
+  let sawOnline = false;
+  while (Date.now() < deadline) {
+    const proc = getPm2Status().find((p) => p.name === name);
+    lastStatus = proc?.pm2_env?.status || 'not_found';
+    if (lastStatus === 'online') {
+      if (sawOnline) return;
+      sawOnline = true;
+    } else {
+      sawOnline = false;
+    }
+    sleepSync(sawOnline ? 2000 : 1000);
+  }
+  throw new Error(`PM2 process '${name}' is not online after deploy (status: ${lastStatus})`);
+};
+
 // ── DOMAINS STORE & NGINX / SSL (kelola dari panel) ─────────────────
 const DOMAINS_DB = path.join(__dirname, 'domains.json');
 
@@ -886,6 +908,7 @@ app.post('/api/projects/:name/deploy', auth, (req, res) => {
       runProjectBuildIfAny(dir);
       refreshPm2StarterScript(name, dir);
       pm2RestartWithEnvFromProject(name);
+      assertProjectOnlineAfterDeploy(name);
       const updated = recordProjectUpdated(dir, 'dashboard');
       res.json({ success: true, updatedAt: updated.updatedAt, updatedCommit: updated.commit });
     } catch (e) {
