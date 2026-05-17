@@ -322,6 +322,59 @@ const readMeta = (app) => {
   );
 };
 
+const normalizeDeployLogTimestamp = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const isoLike = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const withZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(isoLike) ? isoLike : `${isoLike}Z`;
+  const date = new Date(withZone);
+  return Number.isNaN(date.getTime()) ? raw : date.toISOString();
+};
+
+const readLastDeployLogUpdate = (projectDir) => {
+  const deployLog = path.join(projectDir, '.deploy.log');
+  if (!fs.existsSync(deployLog)) return null;
+  try {
+    const lines = fs.readFileSync(deployLog, 'utf8').trim().split('\n').reverse();
+    for (const line of lines) {
+      const m = line.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+Deploy SUCCESS\b/);
+      if (m) return { at: normalizeDeployLogTimestamp(m[1]), by: 'ci/cd', commit: '' };
+    }
+  } catch (_) {}
+  return null;
+};
+
+const getProjectUpdatedInfo = (projectDir, meta) => {
+  const at = meta.UPDATED_AT || meta.LAST_UPDATED_AT || meta.DEPLOYED_AT || '';
+  if (at) {
+    return {
+      at: normalizeDeployLogTimestamp(at),
+      by: meta.UPDATED_BY || meta.LAST_UPDATED_BY || '',
+      commit: meta.UPDATED_COMMIT || meta.LAST_UPDATED_COMMIT || '',
+    };
+  }
+  return readLastDeployLogUpdate(projectDir) || { at: '', by: '', commit: '' };
+};
+
+const getProjectGitCommit = (projectDir) => {
+  try {
+    return execSync(`git -C ${shSingleQuote(projectDir)} rev-parse HEAD`, { encoding: 'utf8' }).trim();
+  } catch (_) {
+    return '';
+  }
+};
+
+const recordProjectUpdated = (projectDir, source) => {
+  const updatedAt = new Date().toISOString();
+  const commit = getProjectGitCommit(projectDir);
+  updateVpsMetaInDir(projectDir, {
+    UPDATED_AT: updatedAt,
+    UPDATED_BY: source,
+    UPDATED_COMMIT: commit,
+  });
+  return { updatedAt, commit };
+};
+
 /** Template GitHub Actions (disalin ke project sebagai .github/workflows/deploy.yml). */
 const CICD_TEMPLATE_PATH = path.join(__dirname, 'cicd.yml');
 
@@ -346,6 +399,28 @@ const getPm2Status = () => {
     const raw = runAs('pm2 jlist');
     return JSON.parse(raw || '[]');
   } catch { return []; }
+};
+
+const sleepSync = (ms) => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+const assertProjectOnlineAfterDeploy = (name, timeoutMs = 30000) => {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus = 'not_found';
+  let sawOnline = false;
+  while (Date.now() < deadline) {
+    const proc = getPm2Status().find((p) => p.name === name);
+    lastStatus = proc?.pm2_env?.status || 'not_found';
+    if (lastStatus === 'online') {
+      if (sawOnline) return;
+      sawOnline = true;
+    } else {
+      sawOnline = false;
+    }
+    sleepSync(sawOnline ? 2000 : 1000);
+  }
+  throw new Error(`PM2 process '${name}' is not online after deploy (status: ${lastStatus})`);
 };
 
 // ── DOMAINS STORE & NGINX / SSL (kelola dari panel) ─────────────────
@@ -729,6 +804,7 @@ app.get('/api/projects', auth, (req, res) => {
     const proc = pm2.find(p => p.name === app);
     const env = readEnv(app);
     const pdir = resolveProjectDir(app);
+    const updated = getProjectUpdatedInfo(pdir, meta);
     return {
       name: app,
       status: proc?.pm2_env?.status || 'stopped',
@@ -737,6 +813,9 @@ app.get('/api/projects', auth, (req, res) => {
       repo: meta.REPO_URL || '',
       branch: meta.BRANCH || 'main',
       installedAt: meta.INSTALLED_AT || '',
+      updatedAt: updated.at,
+      updatedBy: updated.by,
+      updatedCommit: updated.commit,
       uptime: proc?.pm2_env?.pm_uptime || null,
       restarts: proc?.pm2_env?.restart_time || 0,
       memory: proc?.monit?.memory || 0,
@@ -829,7 +908,9 @@ app.post('/api/projects/:name/deploy', auth, (req, res) => {
       runProjectBuildIfAny(dir);
       refreshPm2StarterScript(name, dir);
       pm2RestartWithEnvFromProject(name);
-      res.json({ success: true });
+      assertProjectOnlineAfterDeploy(name);
+      const updated = recordProjectUpdated(dir, 'dashboard');
+      res.json({ success: true, updatedAt: updated.updatedAt, updatedCommit: updated.commit });
     } catch (e) {
       res.status(500).json({ error: 'Deploy failed: ' + e.message });
     }
@@ -1705,7 +1786,7 @@ app.post('/api/database/sync-from-url', auth, jsonLarge, async (req, res) => {
 });
 
 // ── SERVE DASHBOARD ───────────────────────────────────────────
-app.get('/', (req, res) => {
+const sendDashboard = (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1753,6 +1834,20 @@ app.get('/', (req, res) => {
   .btn-danger { background: rgba(248,81,73,.1); border-color: var(--red); color: var(--red); }
   .btn-sm { padding: 4px 10px; font-size: 12px; }
   .btn-group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .project-list-card { position: relative; display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 18px 20px; }
+  .project-info { min-width: 0; flex: 1 1 auto; }
+  .project-title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .project-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+  .project-meta { font-size: 12px; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+  .project-actions { position: relative; flex: 0 0 auto; margin-left: auto; }
+  .project-menu-btn { width: 36px; height: 36px; padding: 0; justify-content: center; font-size: 20px; line-height: 1; }
+  .project-menu { display: none; position: absolute; top: calc(100% + 8px); right: 0; min-width: 190px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); box-shadow: 0 12px 30px rgba(0,0,0,.35); z-index: 30; }
+  .project-actions.open .project-menu { display: block; }
+  .project-menu-item, .project-menu-note { width: 100%; display: flex; align-items: center; justify-content: flex-start; gap: 8px; padding: 9px 10px; border-radius: 6px; border: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; text-align: left; text-decoration: none; cursor: pointer; }
+  .project-menu-item:hover { background: var(--bg3); color: var(--blue); }
+  .project-menu-item.btn-danger { color: var(--red); }
+  .project-menu-item.btn-danger:hover { background: rgba(248,81,73,.1); color: var(--red); }
+  .project-menu-note { color: var(--muted); cursor: default; }
   input, select, textarea { background: var(--bg3); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 13px; width: 100%; outline: none; font-family: inherit; }
   input:focus, select:focus, textarea:focus { border-color: var(--accent); }
   .form-row { margin-bottom: 14px; }
@@ -1761,6 +1856,8 @@ app.get('/', (req, res) => {
   .toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: 13px; z-index: 999; animation: fadeIn .2s; max-width: 320px; }
   .toast.success { border-color: var(--green); }
   .toast.error { border-color: var(--red); }
+  .toast.loading { border-color: var(--blue); display: flex; align-items: center; gap: 10px; }
+  .toast.loading::before { content: ''; display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(88,166,255,.3); border-top-color: var(--blue); border-radius: 50%; animation: dbSpin 0.65s linear infinite; flex-shrink: 0; }
   @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
   .secret-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .secret-key { flex: 1; font-family: monospace; }
@@ -1830,6 +1927,8 @@ app.get('/', (req, res) => {
     .db-toolbar-actions .btn { flex: 1 1 auto; }
     th, td { padding: 10px 8px; font-size: 12px; }
     .btn-group { gap: 4px; }
+    .project-list-card { padding: 16px; gap: 10px; }
+    .project-menu { min-width: 180px; }
     .modal { padding: 20px; }
   }
 </style>
@@ -1863,31 +1962,31 @@ app.get('/', (req, res) => {
           <p id="vps-ip">Loading...</p>
         </div>
         <nav class="nav">
-        <a href="#" class="active" onclick="showPage('overview')">
+        <a href="#overview" class="active" onclick="showPage('overview');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 1.5A1.5 1.5 0 0 1 1.5 0h2A1.5 1.5 0 0 1 5 1.5v2A1.5 1.5 0 0 1 3.5 5h-2A1.5 1.5 0 0 1 0 3.5v-2zM6.5 0A1.5 1.5 0 0 0 5 1.5v2A1.5 1.5 0 0 0 6.5 5h2A1.5 1.5 0 0 0 10 3.5v-2A1.5 1.5 0 0 0 8.5 0h-2zM11 1.5A1.5 1.5 0 0 1 12.5 0h2A1.5 1.5 0 0 1 16 1.5v2A1.5 1.5 0 0 1 14.5 5h-2A1.5 1.5 0 0 1 11 3.5v-2zM1.5 6a1.5 1.5 0 0 0-1.5 1.5v2A1.5 1.5 0 0 0 1.5 11h2A1.5 1.5 0 0 0 5 9.5v-2A1.5 1.5 0 0 0 3.5 6h-2zM6.5 6A1.5 1.5 0 0 0 5 7.5v2A1.5 1.5 0 0 0 6.5 11h2A1.5 1.5 0 0 0 10 9.5v-2A1.5 1.5 0 0 0 8.5 6h-2zM11 7.5A1.5 1.5 0 0 1 12.5 6h2A1.5 1.5 0 0 1 16 7.5v2A1.5 1.5 0 0 1 14.5 11h-2A1.5 1.5 0 0 1 11 9.5v-2zM1.5 11A1.5 1.5 0 0 0 0 12.5v2A1.5 1.5 0 0 0 1.5 16h2A1.5 1.5 0 0 0 5 14.5v-2A1.5 1.5 0 0 0 3.5 11h-2zM6.5 11A1.5 1.5 0 0 0 5 12.5v2A1.5 1.5 0 0 0 6.5 16h2A1.5 1.5 0 0 0 10 14.5v-2A1.5 1.5 0 0 0 8.5 11h-2zM11 12.5a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v2a1.5 1.5 0 0 1-1.5 1.5h-2a1.5 1.5 0 0 1-1.5-1.5v-2z"/></svg>
           Overview
         </a>
-        <a href="#" onclick="showPage('projects')">
+        <a href="#projects" onclick="showPage('projects');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707l-6.45 6.449a.5.5 0 0 1-.354.147H2.5a.5.5 0 0 1-.5-.5v-5.65a.5.5 0 0 1 .146-.354l6.449-6.45a.5.5 0 0 1 .233-.145z"/></svg>
           Projects
         </a>
-        <a href="#" onclick="showPage('domains')">
+        <a href="#domains" onclick="showPage('domains');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M0 4a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V4Zm2-1a1 1 0 0 0-1 1v.217l7 4.2 7-4.2V4a1 1 0 0 0-1-1H2Zm13 2.383-4.708 2.825L15 11.105V5.383Zm-.034 6.876-5.64-3.471L8 9.583l-1.326-.795-5.64 3.47A1 1 0 0 0 2 13h12a1 1 0 0 0 .966-.741ZM1 11.105l4.708-2.897L1 5.383v5.722Z"/></svg>
           Domain
         </a>
-        <a href="#" onclick="showPage('secrets')">
+        <a href="#secrets" onclick="showPage('secrets');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/></svg>
           Secrets
         </a>
-        <a href="#" onclick="showPage('database')">
+        <a href="#database" onclick="showPage('database');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h11A1.5 1.5 0 0 1 15 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9zM2.5 3a.5.5 0 0 0-.5.5V6h12V3.5a.5.5 0 0 0-.5-.5h-11zm12 4H2v5.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5V7z"/></svg>
           Database
         </a>
-        <a href="#" onclick="showPage('logs')">
+        <a href="#logs" onclick="showPage('logs');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M5 1a2 2 0 0 0-2 2v1h10V3a2 2 0 0 0-2-2H5zm6 8H5a1 1 0 0 0 0 2h6a1 1 0 0 0 0-2z"/><path d="M0 7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2h-1v-1a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v1H2a2 2 0 0 1-2-2V7z"/></svg>
           Logs
         </a>
-        <a href="#" onclick="showPage('account')">
+        <a href="#account" onclick="showPage('account');return false;">
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm4 8c0 1-1 1-1 1H3s-1 0-1-1 1-4 6-4 6 3 6 4Zm-1-.004c-.001-.246-.154-.986-.832-1.664C11.516 10.68 10.289 10 8 10c-2.29 0-3.516.68-4.168 1.332-.678.678-.83 1.418-.832 1.664h10Z"/></svg>
           Akun
         </a>
@@ -2208,6 +2307,7 @@ let token = localStorage.getItem('vps_token');
 let projects = [];
 let uninstallVerifyCode = '';
 let uninstallPendingName = '';
+const ROUTE_PAGES = ['overview', 'projects', 'domains', 'secrets', 'database', 'logs', 'account'];
 
 function api(method, path, body) {
   return fetch('/api' + path, {
@@ -2252,6 +2352,14 @@ function toast(msg, type='success', ms) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), dur);
+}
+
+function toastLoading(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast loading';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  return () => el.remove();
 }
 
 function resolveActionButton(ev) {
@@ -2329,19 +2437,40 @@ async function doLogin(ev) {
 
 document.getElementById('login-pass').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
 
-function showPage(name) {
+function pageFromLocation() {
+  const hash = window.location.hash.replace(/^#\\/?/, '').split(/[\\/?]/)[0];
+  if (ROUTE_PAGES.includes(hash)) return hash;
+  const path = window.location.pathname.replace(/^\\/+|\\/+$/g, '');
+  if (ROUTE_PAGES.includes(path)) return path;
+  return 'overview';
+}
+
+function setRoute(name) {
+  const next = name === 'overview' ? '/' : '/#' + name;
+  if ((window.location.pathname + window.location.hash) !== next) {
+    history.pushState(null, '', next);
+  }
+}
+
+function showPage(name, opts) {
+  if (!ROUTE_PAGES.includes(name)) name = 'overview';
+  opts = opts || {};
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav a').forEach(a => a.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
   const navLink = document.querySelector('.nav a[onclick*="' + name + '"]');
   if (navLink) navLink.classList.add('active');
   closeMobileNav();
+  if (opts.updateRoute !== false) setRoute(name);
   if(name==='projects') loadProjects();
   if(name==='domains') loadDomainsPage();
   if(name==='secrets') loadSecretsPage();
   if(name==='logs') loadLogsPage();
   if(name==='database') loadDatabasePage();
 }
+
+window.addEventListener('hashchange', () => showPage(pageFromLocation(), { updateRoute: false }));
+window.addEventListener('popstate', () => showPage(pageFromLocation(), { updateRoute: false }));
 
 async function changeAccountPassword(ev) {
   const errEl = document.getElementById('account-pass-err');
@@ -2384,6 +2513,66 @@ function fmtBytes(b) {
   return (b/1024/1024).toFixed(1)+' MB';
 }
 
+function fmtDate(v) {
+  if (!v) return '';
+  const d = new Date(v);
+  return isNaN(d.getTime())
+    ? String(v).slice(0, 16)
+    : d.toLocaleString('id-ID', {
+        day: '2-digit',
+        month: 'short',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+}
+
+function projectDateLine(p) {
+  const parts = [];
+  if (p.installedAt) parts.push('installed ' + fmtDate(p.installedAt));
+  if (p.updatedAt) parts.push('updated ' + fmtDate(p.updatedAt));
+  return parts.length ? ' &nbsp;·&nbsp; ' + parts.join(' &nbsp;·&nbsp; ') : '';
+}
+
+function closeProjectMenus(except) {
+  document.querySelectorAll('.project-actions.open').forEach(function(el) {
+    if (!except || el !== except) el.classList.remove('open');
+  });
+}
+
+function toggleProjectMenu(id, ev) {
+  if (ev) ev.stopPropagation();
+  const box = document.getElementById(id);
+  if (!box) return;
+  const willOpen = !box.classList.contains('open');
+  closeProjectMenus(box);
+  box.classList.toggle('open', willOpen);
+}
+
+document.addEventListener('click', function(ev) {
+  if (!ev.target.closest || !ev.target.closest('.project-actions')) closeProjectMenus();
+});
+
+function projectActionMenu(p, idx) {
+  const menuId = 'project-actions-' + idx;
+  const nameArg = jsQuoted(p.name);
+  const cicdItem = p.cicdEnabled
+    ? '<span class="project-menu-note">CI/CD aktif</span>'
+    : '<button type="button" class="project-menu-item" onclick="enableProjectCicd(' + nameArg + ', event)">Aktifkan CI/CD</button>';
+  return '<div class="project-actions" id="' + menuId + '">' +
+    '<button type="button" class="btn project-menu-btn" aria-label="Aksi project ' + escapeHtmlAttr(p.name) + '" onclick="toggleProjectMenu(' + jsQuoted(menuId) + ', event)">...</button>' +
+    '<div class="project-menu">' +
+      '<button type="button" class="project-menu-item" onclick="showPage(\\'secrets\\');document.getElementById(\\'secrets-project-select\\').value=' + nameArg + ';loadSecrets()">Secrets</button>' +
+      '<button type="button" class="project-menu-item" onclick="openProjectSettings(' + nameArg + ')">Pengaturan</button>' +
+      cicdItem +
+      '<button type="button" class="project-menu-item" onclick="deployApp(' + nameArg + ', event)">Deploy</button>' +
+      '<button type="button" class="project-menu-item" onclick="restartApp(' + nameArg + ', event)">Restart</button>' +
+      '<button type="button" class="project-menu-item" onclick="showLogs(' + nameArg + ')">Logs</button>' +
+      '<button type="button" class="project-menu-item btn-danger" onclick="uninstallApp(' + nameArg + ')">Uninstall</button>' +
+    '</div>' +
+  '</div>';
+}
+
 async function loadOverview() {
   const [sys, projs] = await Promise.all([api('GET','/system'), api('GET','/projects')]);
   projects = projs;
@@ -2419,33 +2608,21 @@ async function loadProjects() {
   projects = projs;
   document.getElementById('projects-list').innerHTML = projs.length === 0
     ? '<div style="color:var(--muted);text-align:center;padding:40px;">Belum ada project. Klik "Install Project" untuk mulai.</div>'
-    : projs.map(p => \`
-      <div class="card" style="margin-bottom:12px;">
-        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
-          <div>
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
-              <span style="font-size:15px;font-weight:600;">\${p.name}</span>
+    : projs.map((p, idx) => \`
+      <div class="card project-list-card" style="margin-bottom:12px;">
+          <div class="project-info">
+            <div class="project-title-row">
+              <span class="project-name">\${escapeHtmlAttr(p.name)}</span>
               \${statusBadge(p.status)}
               <span class="chip">:\${p.port}</span>
             </div>
-            <div style="font-size:12px;color:var(--muted);">
+            <div class="project-meta">
               \${p.repo ? '<a href="'+p.repo+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.repo.replace('https://github.com/','')+'</a>' : '-'}
               \${p.domain ? ' &nbsp;·&nbsp; <a href="http://'+p.domain+'" target="_blank" style="color:var(--blue);text-decoration:none;">'+p.domain+'</a>' : ''}
-              \${p.installedAt ? ' &nbsp;·&nbsp; installed '+new Date(p.installedAt).toLocaleDateString() : ''}
+              \${projectDateLine(p)}
             </div>
           </div>
-          <div class="btn-group">
-            <button class="btn btn-sm" onclick="showPage('secrets');document.getElementById('secrets-project-select').value='\${p.name}';loadSecrets()" >Secrets</button>
-            <button class="btn btn-sm" onclick="openProjectSettings(\${jsQuoted(p.name)})">Pengaturan</button>
-            \${p.cicdEnabled
-              ? '<span class="chip" title=".github/workflows/deploy.yml">CI/CD aktif</span>'
-              : '<button type="button" class="btn btn-sm" onclick="enableProjectCicd(\\'' + p.name.replace(/'/g, '') + '\\', event)">Aktifkan CI/CD</button>'}
-            <button class="btn btn-sm" onclick="deployApp('\${p.name}', event)">Deploy</button>
-            <button class="btn btn-sm" onclick="restartApp('\${p.name}', event)">Restart</button>
-            <button class="btn btn-sm" onclick="showLogs('\${p.name}')">Logs</button>
-            <button class="btn btn-sm btn-danger" onclick="uninstallApp('\${p.name}')">Uninstall</button>
-          </div>
-        </div>
+          \${projectActionMenu(p, idx)}
       </div>
     \`).join('');
 }
@@ -2747,28 +2924,43 @@ async function confirmUninstallProject() {
 }
 
 async function deployApp(name, ev) {
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    const res = await api('POST',\`/projects/\${name}/deploy\`);
-    if(res.error) toast(res.error,'error');
-    else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); loadProjects(); }
+    const dismiss = toastLoading('Mendeploy ' + name + '...');
+    try {
+      const res = await api('POST',\`/projects/\${name}/deploy\`);
+      dismiss();
+      if(res.error) toast(res.error,'error');
+      else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); loadProjects(); }
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
 async function enableProjectCicd(name, ev) {
   if (!confirm('Membuat .github/workflows/deploy.yml (dari template manager), lalu git add ., commit, dan push ke remote. Lanjut?')) return;
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
-    if (data.error) toast(data.error, 'error');
-    else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+    const dismiss = toastLoading('Mengaktifkan CI/CD untuk ' + name + '...');
+    try {
+      const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
+      dismiss();
+      if (data.error) toast(data.error, 'error');
+      else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
 async function restartApp(name, ev) {
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    await api('POST',\`/projects/\${name}/restart\`);
-    toast(\`\${name} direstart!\`);
-    loadOverview();
-    loadProjects();
+    const dismiss = toastLoading('Merestart ' + name + '...');
+    try {
+      await api('POST',\`/projects/\${name}/restart\`);
+      dismiss();
+      toast(\`\${name} direstart!\`);
+      loadOverview();
+      loadProjects();
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
@@ -3220,6 +3412,7 @@ async function initDashboard() {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   await loadOverview();
+  showPage(pageFromLocation(), { updateRoute: false });
   setInterval(loadOverview, 10000);
 }
 
@@ -3229,7 +3422,10 @@ else { document.getElementById('login-screen').style.display = 'block'; }
 </script>
 </body>
 </html>`);
-});
+};
+
+app.get('/', sendDashboard);
+app.get(/^\/(overview|projects|domains|secrets|database|logs|account)\/?$/, sendDashboard);
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`VPS Manager Dashboard running on http://0.0.0.0:${PORT}`);
