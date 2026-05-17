@@ -1856,6 +1856,8 @@ const sendDashboard = (req, res) => {
   .toast { position: fixed; bottom: 24px; right: 24px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; font-size: 13px; z-index: 999; animation: fadeIn .2s; max-width: 320px; }
   .toast.success { border-color: var(--green); }
   .toast.error { border-color: var(--red); }
+  .toast.loading { border-color: var(--blue); display: flex; align-items: center; gap: 10px; }
+  .toast.loading::before { content: ''; display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(88,166,255,.3); border-top-color: var(--blue); border-radius: 50%; animation: dbSpin 0.65s linear infinite; flex-shrink: 0; }
   @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:none; } }
   .secret-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .secret-key { flex: 1; font-family: monospace; }
@@ -2350,6 +2352,14 @@ function toast(msg, type='success', ms) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), dur);
+}
+
+function toastLoading(msg) {
+  const el = document.createElement('div');
+  el.className = 'toast loading';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  return () => el.remove();
 }
 
 function resolveActionButton(ev) {
@@ -2914,28 +2924,43 @@ async function confirmUninstallProject() {
 }
 
 async function deployApp(name, ev) {
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    const res = await api('POST',\`/projects/\${name}/deploy\`);
-    if(res.error) toast(res.error,'error');
-    else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); loadProjects(); }
+    const dismiss = toastLoading('Mendeploy ' + name + '...');
+    try {
+      const res = await api('POST',\`/projects/\${name}/deploy\`);
+      dismiss();
+      if(res.error) toast(res.error,'error');
+      else { toast(\`\${name} berhasil dideploy!\`); loadOverview(); loadProjects(); }
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
 async function enableProjectCicd(name, ev) {
   if (!confirm('Membuat .github/workflows/deploy.yml (dari template manager), lalu git add ., commit, dan push ke remote. Lanjut?')) return;
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
-    if (data.error) toast(data.error, 'error');
-    else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+    const dismiss = toastLoading('Mengaktifkan CI/CD untuk ' + name + '...');
+    try {
+      const data = await api('POST', '/projects/' + encodeURIComponent(name) + '/enable-cicd');
+      dismiss();
+      if (data.error) toast(data.error, 'error');
+      else { toast('CI/CD diaktifkan; perubahan sudah di-push.'); loadProjects(); }
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
 async function restartApp(name, ev) {
+  closeProjectMenus();
   await withButtonBusy(resolveActionButton(ev), async () => {
-    await api('POST',\`/projects/\${name}/restart\`);
-    toast(\`\${name} direstart!\`);
-    loadOverview();
-    loadProjects();
+    const dismiss = toastLoading('Merestart ' + name + '...');
+    try {
+      await api('POST',\`/projects/\${name}/restart\`);
+      dismiss();
+      toast(\`\${name} direstart!\`);
+      loadOverview();
+      loadProjects();
+    } catch(e) { dismiss(); throw e; }
   });
 }
 
