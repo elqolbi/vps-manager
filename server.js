@@ -423,6 +423,18 @@ const assertProjectOnlineAfterDeploy = (name, timeoutMs = 30000) => {
   throw new Error(`PM2 process '${name}' is not online after deploy (status: ${lastStatus})`);
 };
 
+// ── DATABASE NOTES STORE ──────────────────────────────────────────────────────
+const DB_NOTES_PATH = path.join(__dirname, 'db-notes.json');
+
+const loadDbNotes = () => {
+  try { return JSON.parse(fs.readFileSync(DB_NOTES_PATH, 'utf8')); } catch { return {}; }
+};
+
+const saveDbNotes = (notes) => {
+  fs.writeFileSync(DB_NOTES_PATH, JSON.stringify(notes, null, 2), 'utf8');
+  try { run(`chown ${APP_USER}:${APP_USER} ${DB_NOTES_PATH}`); } catch (_) {}
+};
+
 // ── DOMAINS STORE & NGINX / SSL (kelola dari panel) ─────────────────
 const DOMAINS_DB = path.join(__dirname, 'domains.json');
 
@@ -1619,6 +1631,20 @@ app.get('/api/database/status', auth, (req, res) => {
   });
 });
 
+app.get('/api/database/notes', auth, (req, res) => {
+  res.json(loadDbNotes());
+});
+
+app.put('/api/database/notes/:db', auth, (req, res) => {
+  const { db } = req.params;
+  if (!isValidPgDbName(db)) return res.status(400).json({ error: 'Invalid database name' });
+  const note = typeof req.body.note === 'string' ? req.body.note.slice(0, 200).trim() : '';
+  const notes = loadDbNotes();
+  if (note) { notes[db] = note; } else { delete notes[db]; }
+  saveDbNotes(notes);
+  res.json({ ok: true });
+});
+
 /** Host aman untuk bagian host di connection URL (localhost / hostname / IPv4 sederhana). */
 const sanitizeDbConnHost = (h) => {
   if (typeof h !== 'string' || h.length > 253) return 'localhost';
@@ -1883,6 +1909,11 @@ const sendDashboard = (req, res) => {
   .db-list-table thead th { background: var(--bg3); font-size: 12px; }
   .db-list-row:hover td { background: var(--bg3); cursor: pointer; }
   .db-row-actions { white-space: nowrap; }
+  .db-note-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .db-note-edit-btn { opacity: 0; transition: opacity .15s; padding: 2px 7px; font-size: 11px; flex-shrink: 0; }
+  .db-list-row:hover .db-note-edit-btn { opacity: 1; }
+  .db-note-inline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .db-note-input { width: 160px; padding: 4px 8px; font-size: 12px; }
   .db-detail-top { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
   .db-detail-breadcrumb { font-size: 15px; }
   .db-hidden { display: none !important; }
@@ -3048,6 +3079,7 @@ async function loadLogs() {
 
 var browseState = { db: '', schema: 'public', table: '', offset: 0, limit: 50 };
 var dbDetailName = '';
+var dbNotes = {};
 
 function escapeHtmlBrowse(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -3075,9 +3107,42 @@ function renderDatabaseListRows(st, databases) {
     return;
   }
   tbody.innerHTML = databases.map(function(d) {
-    const badge = d === defDb ? '<span class="badge badge-green">Default app</span>' : '<span style="color:var(--muted);">—</span>';
-    return '<tr class="db-list-row" onclick="openDatabaseDetail(\\'' + d + '\\')"><td style="padding-left:18px;"><code style="font-size:13px;">' + escapeHtmlBrowse(d) + '</code></td><td>' + badge + '</td><td style="text-align:right;padding-right:18px;" class="db-row-actions" onclick="event.stopPropagation()"><button type="button" class="btn btn-sm" onclick="copyDbConnectionUrl(\\'' + d + '\\')" title="postgresql://… ke clipboard">Salin URL</button> <button type="button" class="btn btn-sm btn-primary" onclick="openDatabaseDetail(\\'' + d + '\\')">Kelola</button> <button type="button" class="btn btn-sm" onclick="exportLocalDatabase(\\'' + d + '\\')">Export</button></td></tr>';
+    const isDefault = d === defDb;
+    const note = dbNotes[d] || '';
+    const badgeHtml = isDefault ? '<span class="badge badge-green">Default app</span>' : '';
+    const noteHtml = note
+      ? '<span class="db-note-text" style="font-size:12px;color:var(--muted);">' + escapeHtmlBrowse(note) + '</span>'
+      : '<span class="db-note-text" style="color:var(--muted);">—</span>';
+    const editBtn = '<button type="button" class="btn btn-sm db-note-edit-btn" onclick="startDbNoteEdit(' + jsQuoted(d) + ', this)" title="Edit catatan">✏</button>';
+    const noteCell = '<div class="db-note-cell">' + badgeHtml + noteHtml + editBtn + '</div>';
+    return '<tr class="db-list-row" onclick="openDatabaseDetail(\\'' + d + '\\')"><td style="padding-left:18px;"><code style="font-size:13px;">' + escapeHtmlBrowse(d) + '</code></td><td onclick="event.stopPropagation()">' + noteCell + '</td><td style="text-align:right;padding-right:18px;" class="db-row-actions" onclick="event.stopPropagation()"><button type="button" class="btn btn-sm" onclick="copyDbConnectionUrl(\\'' + d + '\\')" title="postgresql://… ke clipboard">Salin URL</button> <button type="button" class="btn btn-sm btn-primary" onclick="openDatabaseDetail(\\'' + d + '\\')">Kelola</button> <button type="button" class="btn btn-sm" onclick="exportLocalDatabase(\\'' + d + '\\')">Export</button></td></tr>';
   }).join('');
+}
+
+function startDbNoteEdit(dbName, btn) {
+  const cell = btn.closest('td');
+  const current = dbNotes[dbName] || '';
+  cell.innerHTML = '<div class="db-note-inline">' +
+    '<input class="db-note-input" type="text" maxlength="200" placeholder="Tulis catatan..." value="' + escapeHtmlAttr(current) + '" onkeydown="if(event.key===\'Escape\')cancelDbNoteEdit(' + jsQuoted(dbName) + ',this)">' +
+    '<button type="button" class="btn btn-sm btn-primary" onclick="confirmSaveDbNote(' + jsQuoted(dbName) + ',this)">Simpan</button>' +
+    '<button type="button" class="btn btn-sm" onclick="cancelDbNoteEdit(' + jsQuoted(dbName) + ',this)">Batal</button>' +
+    '</div>';
+  cell.querySelector('input').focus();
+}
+
+async function confirmSaveDbNote(dbName, btn) {
+  const cell = btn.closest('td');
+  const input = cell.querySelector('input');
+  const note = input ? input.value.trim() : '';
+  btn.disabled = true;
+  const res = await api('PUT', '/database/notes/' + encodeURIComponent(dbName), { note });
+  if (res.error) { toast(res.error, 'error'); btn.disabled = false; return; }
+  toast('Catatan disimpan');
+  await loadDatabasePage();
+}
+
+async function cancelDbNoteEdit(dbName, el) {
+  await loadDatabasePage();
 }
 
 function switchDbDetailTab(tab) {
@@ -3242,7 +3307,11 @@ async function loadDatabasePage() {
   if (listEl) listEl.style.display = 'block';
   if (detEl) detEl.style.display = 'none';
   const statusCard = document.getElementById('db-list-status');
-  const st = await api('GET', '/database/status');
+  const [st, data, notes] = await Promise.all([
+    api('GET', '/database/status'),
+    api('GET', '/database/browse/databases'),
+    api('GET', '/database/notes'),
+  ]);
   if (st.error) {
     if (statusCard) statusCard.innerHTML = '<div style="color:var(--red);">' + escapeHtmlBrowse(st.error) + '</div>';
     return;
@@ -3250,7 +3319,7 @@ async function loadDatabasePage() {
   if (statusCard) {
     statusCard.innerHTML = '<div style="font-size:13px;line-height:1.65;color:var(--muted);"><strong style="color:var(--text);font-weight:500;">' + escapeHtmlBrowse(st.local.user) + '@' + escapeHtmlBrowse(String(st.local.host)) + ':' + String(st.local.port) + '</strong> · Default aplikasi: <code>' + escapeHtmlBrowse(st.local.database) + '</code> · Folder cadangan: <code>' + escapeHtmlBrowse(st.dumpDir) + '</code></div>';
   }
-  const data = await api('GET', '/database/browse/databases');
+  dbNotes = (notes && !notes.error) ? notes : {};
   const tbody = document.getElementById('db-list-body');
   if (data.error) {
     if (tbody) tbody.innerHTML = '<tr><td colspan="3" style="padding:20px;color:var(--red);">' + escapeHtmlBrowse(data.error) + '</td></tr>';
