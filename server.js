@@ -3123,7 +3123,7 @@ function startDbNoteEdit(dbName, btn) {
   const cell = btn.closest('td');
   const current = dbNotes[dbName] || '';
   cell.innerHTML = '<div class="db-note-inline">' +
-    '<input class="db-note-input" type="text" maxlength="200" placeholder="Tulis catatan..." value="' + escapeHtmlAttr(current) + '" onkeydown="if(event.key===\'Escape\')cancelDbNoteEdit(' + jsQuoted(dbName) + ',this)">' +
+    '<input class="db-note-input" type="text" maxlength="200" placeholder="Tulis catatan..." value="' + escapeHtmlAttr(current) + '" onkeydown="if(event.key===\\"Escape\\")cancelDbNoteEdit(' + jsQuoted(dbName) + ',this)">' +
     '<button type="button" class="btn btn-sm btn-primary" onclick="confirmSaveDbNote(' + jsQuoted(dbName) + ',this)">Simpan</button>' +
     '<button type="button" class="btn btn-sm" onclick="cancelDbNoteEdit(' + jsQuoted(dbName) + ',this)">Batal</button>' +
     '</div>';
