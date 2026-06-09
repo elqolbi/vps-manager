@@ -26,6 +26,12 @@ const PG_DB = process.env.PG_DB || 'appdb';
 const REDIS_PASS = process.env.REDIS_PASS || '';
 const DASHBOARD_PASS = process.env.DASHBOARD_PASS || 'admin123';
 const AUTH_FILE = path.join(__dirname, '.dashboard-auth.json');
+const LOGIN_LOCK_FILE = process.env.LOGIN_LOCK_FILE || path.join(__dirname, '.login-lock.json');
+const LOGIN_MAX_FAILED_ATTEMPTS = Math.max(
+  1,
+  parseInt(process.env.LOGIN_MAX_FAILED_ATTEMPTS || '3', 10) || 3,
+);
+const LOGIN_UNLOCK_COMMAND = `node ${JSON.stringify(path.join(__dirname, 'server.js'))} unlock-login`;
 
 const readPasswordHash = () => {
   try {
@@ -44,6 +50,93 @@ const saveDashboardPassword = (password) => {
   const passwordHash = bcrypt.hashSync(String(password), 10);
   fs.writeFileSync(AUTH_FILE, JSON.stringify({ passwordHash }), { mode: 0o600 });
 };
+
+const emptyLoginLockState = () => ({
+  failedAttempts: 0,
+  locked: false,
+});
+
+const readLoginLockState = () => {
+  try {
+    const data = JSON.parse(fs.readFileSync(LOGIN_LOCK_FILE, 'utf8'));
+    const failedAttempts = Number.isInteger(data.failedAttempts) && data.failedAttempts > 0 ? data.failedAttempts : 0;
+    const locked = !!data.locked || failedAttempts >= LOGIN_MAX_FAILED_ATTEMPTS;
+    return {
+      failedAttempts,
+      locked,
+      lockedAt: locked ? (data.lockedAt || null) : null,
+      lastFailedAt: data.lastFailedAt || null,
+      lastFailedIp: data.lastFailedIp || null,
+    };
+  } catch (_) {
+    return emptyLoginLockState();
+  }
+};
+
+const writeLoginLockState = (state) => {
+  fs.writeFileSync(LOGIN_LOCK_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+  fs.chmodSync(LOGIN_LOCK_FILE, 0o600);
+};
+
+const resetLoginLockState = () => {
+  try {
+    fs.unlinkSync(LOGIN_LOCK_FILE);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+};
+
+const clientIpFromRequest = (req) => {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0].trim();
+  return req.socket?.remoteAddress || req.ip || '';
+};
+
+const publicLoginLockState = (state = readLoginLockState()) => {
+  const publicState = {
+    locked: !!state.locked,
+    failedAttempts: state.failedAttempts,
+    maxFailedAttempts: LOGIN_MAX_FAILED_ATTEMPTS,
+    remainingAttempts: state.locked ? 0 : Math.max(LOGIN_MAX_FAILED_ATTEMPTS - state.failedAttempts, 0),
+    lockedAt: state.lockedAt || null,
+  };
+  if (state.locked) publicState.unlockCommand = LOGIN_UNLOCK_COMMAND;
+  return publicState;
+};
+
+const recordFailedLogin = (req) => {
+  const state = readLoginLockState();
+  const failedAttempts = state.failedAttempts + 1;
+  const locked = failedAttempts >= LOGIN_MAX_FAILED_ATTEMPTS;
+  const nextState = {
+    ...state,
+    failedAttempts,
+    locked,
+    lastFailedAt: new Date().toISOString(),
+    lastFailedIp: clientIpFromRequest(req),
+    lockedAt: locked ? (state.lockedAt || new Date().toISOString()) : null,
+  };
+  writeLoginLockState(nextState);
+  return nextState;
+};
+
+const handleLoginLockCommand = () => {
+  const command = process.argv[2];
+  if (!['unlock-login', '--unlock-login', 'login-lock-status', '--login-lock-status'].includes(command)) return false;
+
+  if (command.includes('status')) {
+    console.log(JSON.stringify(publicLoginLockState(), null, 2));
+    return true;
+  }
+
+  resetLoginLockState();
+  console.log('Login VPS Manager sudah diaktifkan kembali.');
+  return true;
+};
+
+if (handleLoginLockCommand()) {
+  process.exit(0);
+}
 /** Identitas commit untuk perintah git dari manager (user deploy sering belum punya user.name / user.email global). */
 const MANAGER_GIT_AUTHOR_NAME = process.env.MANAGER_GIT_AUTHOR_NAME || 'VPS Manager';
 const MANAGER_GIT_AUTHOR_EMAIL = process.env.MANAGER_GIT_AUTHOR_EMAIL || 'vps-manager@localhost';
@@ -66,7 +159,26 @@ app.use((req, res, next) => {
 // ── AUTH ─────────────────────────────────────────────────────
 app.post('/api/login', (req, res) => {
   const { password } = req.body;
-  if (!verifyDashboardPassword(password)) return res.status(401).json({ error: 'Wrong password' });
+  const lockState = readLoginLockState();
+  if (lockState.locked) {
+    return res.status(423).json({
+      error: 'Login diblokir karena sandi salah 3 kali. Aktifkan kembali dari command VPS.',
+      ...publicLoginLockState(lockState),
+    });
+  }
+
+  if (!verifyDashboardPassword(password)) {
+    const failedState = recordFailedLogin(req);
+    const status = failedState.locked ? 423 : 401;
+    return res.status(status).json({
+      error: failedState.locked
+        ? 'Login diblokir karena sandi salah 3 kali. Aktifkan kembali dari command VPS.'
+        : `Password salah. Sisa percobaan: ${Math.max(LOGIN_MAX_FAILED_ATTEMPTS - failedState.failedAttempts, 0)}.`,
+      ...publicLoginLockState(failedState),
+    });
+  }
+
+  resetLoginLockState();
   const token = jwt.sign({ role: 'admin' }, SECRET, { expiresIn: '24h' });
   res.json({ token });
 });
@@ -2453,15 +2565,21 @@ function showDbJobFinished(ok, htmlInner) {
 
 async function doLogin(ev) {
   await withButtonBusy(resolveActionButton(ev), async () => {
+    const errEl = document.getElementById('login-err');
+    errEl.textContent = '';
     const pass = document.getElementById('login-pass').value;
     const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pass}) });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (data.token) {
       token = data.token;
       localStorage.setItem('vps_token', token);
       initDashboard();
     } else {
-      document.getElementById('login-err').textContent = 'Password salah!';
+      var msg = data.error || 'Password salah!';
+      if (data.locked && data.unlockCommand) {
+        msg += ' Command unlock: ' + data.unlockCommand;
+      }
+      errEl.textContent = msg;
     }
   });
 }
